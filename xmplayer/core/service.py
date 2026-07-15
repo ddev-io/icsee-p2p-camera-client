@@ -747,12 +747,12 @@ def _normalize_alarm_title(row: dict[str, Any]) -> str:
     )
     lower = raw.lower()
     if any(item in lower for item in ('human', 'person', 'people', 'pedestrian', 'humanoid')):
-        return 'Человек обнаружен'
+        return 'Person detected'
     if any(item in lower for item in ('motion', 'move')):
-        return 'Движение обнаружено'
+        return 'Motion detected'
     if any(item in lower for item in ('alarm', 'event')):
-        return 'Событие камеры'
-    return raw or 'Сообщение камеры'
+        return 'Camera event'
+    return raw or 'Camera message'
 
 
 def _normalize_alarm_time(row: dict[str, Any]) -> str:
@@ -1322,11 +1322,11 @@ def _recording_title(row: dict[str, Any]) -> str:
     time_label = begin_time.split(' ', 1)[1] if ' ' in begin_time else begin_time
     lower_name = file_name.lower()
     if '[m]' in lower_name:
-        prefix = 'Движение'
+        prefix = 'Motion'
     elif '[r]' in lower_name:
-        prefix = 'Постоянная запись'
+        prefix = 'Continuous recording'
     else:
-        prefix = 'Запись'
+        prefix = 'Recording'
     return f'{prefix} {time_label}'.strip()
 
 

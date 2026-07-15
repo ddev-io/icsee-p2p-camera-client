@@ -252,7 +252,7 @@ def main() -> int:
             tk.Label(left, text=self.config_data.device_name, fg=self.palette['text'], bg=self.palette['panel'], font=('Segoe UI Semibold', 18)).pack(anchor='w')
             mode_row = tk.Frame(left, bg=self.palette['panel'])
             mode_row.pack(anchor='w', fill='x', pady=(8, 0))
-            self.mode_var = tk.StringVar(value='РЕАЛЬНОЕ ВРЕМЯ')
+            self.mode_var = tk.StringVar(value='LIVE')
             self.mode_badge = tk.Label(
                 mode_row,
                 textvariable=self.mode_var,
@@ -263,7 +263,7 @@ def main() -> int:
                 pady=4,
             )
             self.mode_badge.pack(side='left')
-            self.mode_detail_var = tk.StringVar(value='Онлайн поток камеры')
+            self.mode_detail_var = tk.StringVar(value='Camera live stream')
             self.mode_detail_label = tk.Label(
                 mode_row,
                 textvariable=self.mode_detail_var,
@@ -288,9 +288,9 @@ def main() -> int:
             tabbar = tk.Frame(self, bg=self.palette['bg'])
             tabbar.pack(fill='x', padx=18, pady=(0, 10))
             for key, label in (
-                ('live', 'Реальное время'),
-                ('recordings', 'Запись'),
-                ('messages', 'Сооб.'),
+                ('live', 'Live'),
+                ('recordings', 'Recordings'),
+                ('messages', 'Messages'),
             ):
                 btn = tk.Button(
                     tabbar,
@@ -517,11 +517,11 @@ def main() -> int:
 
             top = tk.Frame(shell, bg=self.palette['panel'])
             top.pack(fill='x', padx=18, pady=(18, 8))
-            tk.Label(top, text='Сегодня', fg=self.palette['text'], bg=self.palette['panel'], font=('Segoe UI Semibold', 16)).pack(side='left')
-            self.recordings_count_var = tk.StringVar(value='Всего записей: 0')
+            tk.Label(top, text='Today', fg=self.palette['text'], bg=self.palette['panel'], font=('Segoe UI Semibold', 16)).pack(side='left')
+            self.recordings_count_var = tk.StringVar(value='Recordings: 0')
             refresh = tk.Button(
                 top,
-                text='Обновить',
+                text='Refresh',
                 command=self._refresh_recordings,
                 relief='flat',
                 bd=0,
@@ -574,9 +574,9 @@ def main() -> int:
             if self._closing or self._recordings_worker_alive():
                 return
             self._recordings_loaded = True
-            self.recordings_count_var.set('Всего записей: ...')
+            self.recordings_count_var.set('Recordings: ...')
             self.recordings_refresh_button.configure(state='disabled')
-            self._render_recordings([], empty_text='Загрузка записей...')
+            self._render_recordings([], empty_text='Loading recordings...')
             self._recordings_generation += 1
             generation = self._recordings_generation
 
@@ -602,7 +602,7 @@ def main() -> int:
             self,
             recordings: list[RecordingItem],
             *,
-            empty_text: str = 'Записей пока нет',
+            empty_text: str = 'No recordings yet',
         ) -> None:
             scroll_position = 0.0
             try:
@@ -637,7 +637,7 @@ def main() -> int:
                 tk.Label(text_box, text=period, fg=self.palette['muted'], bg=self.palette['panel'], font=('Segoe UI', 10)).pack(anchor='w', pady=(2, 0))
                 detail_parts = []
                 if item.duration_seconds:
-                    detail_parts.append(f'длительность {self._format_recording_duration(item.duration_seconds)}')
+                    detail_parts.append(f'duration {self._format_recording_duration(item.duration_seconds)}')
                 if item.file_length:
                     detail_parts.append(f'{item.file_length} KB')
                 if item.file_name:
@@ -646,7 +646,7 @@ def main() -> int:
                     tk.Label(text_box, text=' · '.join(detail_parts), fg=self.palette['muted'], bg=self.palette['panel'], font=('Segoe UI', 9)).pack(anchor='w', pady=(2, 0))
                 tk.Button(
                     row,
-                    text='Воспроизвести',
+                    text='Play',
                     command=lambda selected=item: self._on_recording_play(selected),
                     state='normal',
                     relief='flat',
@@ -667,22 +667,22 @@ def main() -> int:
         def _handle_recordings_result(self, recordings: list[RecordingItem], meta: dict[str, Any]) -> None:
             total_count = meta.get('total_count')
             if total_count not in (None, ''):
-                self.recordings_count_var.set(f'Всего записей: {total_count}')
+                self.recordings_count_var.set(f'Recordings: {total_count}')
             else:
-                self.recordings_count_var.set(f'Всего записей: {len(recordings)}')
+                self.recordings_count_var.set(f'Recordings: {len(recordings)}')
             ret = meta.get('response_ret')
             if ret not in (None, ''):
                 self.recordings_status_var.set(f'OPFileQuery Ret={ret}')
             else:
-                self.recordings_status_var.set('Записи камеры загружены')
+                self.recordings_status_var.set('Camera recordings loaded')
             self.recordings_refresh_button.configure(state='normal')
             self._render_recordings(recordings)
 
         def _handle_recordings_error(self, message: str) -> None:
-            self.recordings_count_var.set('Всего записей: 0')
-            self.recordings_status_var.set(f'Ошибка загрузки записей: {message}')
+            self.recordings_count_var.set('Recordings: 0')
+            self.recordings_status_var.set(f'Failed to load recordings: {message}')
             self.recordings_refresh_button.configure(state='normal')
-            self._render_recordings([], empty_text=f'Ошибка загрузки записей: {message}')
+            self._render_recordings([], empty_text=f'Failed to load recordings: {message}')
 
         def _build_messages_page(self, parent):
             page = tk.Frame(parent, bg=self.palette['bg'])
@@ -691,11 +691,11 @@ def main() -> int:
 
             top = tk.Frame(shell, bg=self.palette['panel'])
             top.pack(fill='x', padx=18, pady=(18, 8))
-            tk.Label(top, text='Сегодня', fg=self.palette['text'], bg=self.palette['panel'], font=('Segoe UI Semibold', 16)).pack(side='left')
-            self.messages_count_var = tk.StringVar(value='Всего сообщений: 0')
+            tk.Label(top, text='Today', fg=self.palette['text'], bg=self.palette['panel'], font=('Segoe UI Semibold', 16)).pack(side='left')
+            self.messages_count_var = tk.StringVar(value='Messages: 0')
             refresh = tk.Button(
                 top,
-                text='Обновить',
+                text='Refresh',
                 command=self._refresh_messages,
                 relief='flat',
                 bd=0,
@@ -748,9 +748,9 @@ def main() -> int:
             if self._closing or self._messages_worker_alive():
                 return
             self._messages_loaded = True
-            self.messages_count_var.set('Всего сообщений: ...')
+            self.messages_count_var.set('Messages: ...')
             self.messages_refresh_button.configure(state='disabled')
-            self._render_messages([], empty_text='Загрузка сообщений...')
+            self._render_messages([], empty_text='Loading messages...')
             self._messages_generation += 1
             generation = self._messages_generation
 
@@ -801,7 +801,7 @@ def main() -> int:
             messages: list[MonitorMessage],
             thumbs: dict[int, list[Any]] | None = None,
             *,
-            empty_text: str = 'Сообщений пока нет',
+            empty_text: str = 'No messages yet',
         ) -> None:
             thumbs = thumbs or {}
             scroll_position = 0.0
@@ -837,7 +837,7 @@ def main() -> int:
                 text_box = tk.Frame(row, bg=self.palette['panel'])
                 text_box.pack(side='left', fill='x', expand=True)
                 tk.Label(text_box, text=item.title, fg=self.palette['text'], bg=self.palette['panel'], font=('Segoe UI Semibold', 12)).pack(anchor='w')
-                time_text = item.timestamp or 'Время не указано'
+                time_text = item.timestamp or 'Time unavailable'
                 tk.Label(text_box, text=time_text, fg=self.palette['muted'], bg=self.palette['panel'], font=('Segoe UI', 10)).pack(anchor='w', pady=(2, 0))
                 if item.detail:
                     tk.Label(text_box, text=item.detail[:120], fg=self.palette['muted'], bg=self.palette['panel'], font=('Segoe UI', 9)).pack(anchor='w', pady=(2, 0))
@@ -1073,34 +1073,34 @@ def main() -> int:
             warning = str(meta.get('warning') or '')
             total_count = meta.get('total_count')
             if total_count not in (None, ''):
-                self.messages_count_var.set(f'Всего сообщений: {total_count}')
+                self.messages_count_var.set(f'Messages: {total_count}')
             else:
-                self.messages_count_var.set(f'Всего сообщений: {len(messages)}')
+                self.messages_count_var.set(f'Messages: {len(messages)}')
             if warning and not messages:
                 self.messages_status_var.set(warning)
             elif warning:
                 self.messages_status_var.set(warning)
             else:
-                self.messages_status_var.set('Сообщения камеры загружены')
+                self.messages_status_var.set('Camera messages loaded')
             self.messages_refresh_button.configure(state='normal')
             self._render_messages(messages, thumbs)
 
         def _handle_messages_error(self, message: str) -> None:
-            self.messages_count_var.set('Всего сообщений: 0')
-            self.messages_status_var.set(f'Ошибка загрузки сообщений: {message}')
+            self.messages_count_var.set('Messages: 0')
+            self.messages_status_var.set(f'Failed to load messages: {message}')
             self.messages_refresh_button.configure(state='normal')
-            self._render_messages([], empty_text=f'Ошибка загрузки сообщений: {message}')
+            self._render_messages([], empty_text=f'Failed to load messages: {message}')
 
         def _recording_summary_text(self, recording: RecordingItem | None = None) -> str:
             item = recording or self._current_recording
             if item is None:
-                return 'Онлайн поток камеры'
+                return 'Camera live stream'
             period = item.start_time
             if item.end_time:
                 period = f'{item.start_time}  ->  {item.end_time}'
             parts = [period]
             if item.duration_seconds:
-                parts.append(f'длительность {self._format_recording_duration(item.duration_seconds)}')
+                parts.append(f'duration {self._format_recording_duration(item.duration_seconds)}')
             if item.title:
                 parts.append(item.title)
             return '   |   '.join(parts)
@@ -1110,8 +1110,8 @@ def main() -> int:
                 return
             playback = self._current_recording is not None
             accent = self.palette['warn'] if playback else self.palette['accent']
-            mode_text = 'ЗАПИСЬ' if playback else 'РЕАЛЬНОЕ ВРЕМЯ'
-            detail_text = self._recording_summary_text() if playback else 'Онлайн поток камеры'
+            mode_text = 'RECORDING' if playback else 'LIVE'
+            detail_text = self._recording_summary_text() if playback else 'Camera live stream'
             self.mode_var.set(mode_text)
             self.mode_detail_var.set(detail_text)
             self.mode_badge.configure(bg=accent)
@@ -1120,7 +1120,7 @@ def main() -> int:
             self.video_mode_badge.configure(bg=accent)
             self.video_frame.configure(highlightbackground=accent if playback else self.palette['border'])
             if playback:
-                self.playback_banner_var.set(f'Воспроизведение записи: {detail_text}')
+                self.playback_banner_var.set(f'Recording playback: {detail_text}')
                 self.playback_banner.configure(bg='#21190c', highlightbackground=accent)
                 self.playback_banner_label.configure(bg='#21190c')
                 if not self._playback_banner_packed:
@@ -1248,7 +1248,7 @@ def main() -> int:
             else:
                 self._startup_progress_value = max(self._startup_progress_value, target)
             progress = min(max(self._startup_progress_value, 0.0), 0.98)
-            title = 'Загрузка записи' if self._current_recording is not None else 'Загрузка live'
+            title = 'Loading recording' if self._current_recording is not None else 'Loading live stream'
             label = parsed_label or state
             self.startup_progress_var.set(f'{title}: {label}')
             self.startup_progress_percent_var.set(f'{int(progress * 100)}%')
