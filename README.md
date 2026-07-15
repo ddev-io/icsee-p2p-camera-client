@@ -1,0 +1,68 @@
+﻿# xmplayer
+
+Standalone Python desktop monitor GUI for one iCSee/XM camera.
+
+## What this project does
+
+- runs the self-contained cloud refresh + first/second 6611 live chain
+- extracts the second-flow media stream
+- decrypts `FC` with `VEKEY1` and passes `FD` through as HEVC slices
+- decodes video on desktop through a locally installed `ffmpeg`
+- renders frames in a Tkinter monitor window
+
+## Project rules
+
+- this project is standalone
+- it does not import from `iCSee_v7.7.7_G(77730)_src` at runtime
+- logs stay in `logs/`
+- screenshots stay in `screenshots/`
+
+## System dependencies
+
+You need these installed in the Python/runtime environment used to start the GUI:
+
+- Python 3.11+
+- `tkinter`
+- `Pillow`
+- `pycryptodome`
+- `ffmpeg` must be available on `PATH`, or set `ffmpeg_path` in `desktop_monitor.json` to its executable
+
+## Setup
+
+1. Create `login.txt` next to `desktop_monitor.json`; its first two lines are your cloud login and password. This file is ignored by Git.
+2. Set your camera `device_id` in `desktop_monitor.json`. The published configuration intentionally leaves it empty.
+3. Edit `desktop_monitor.json` if you need another window size or `ffmpeg_path`.
+   You can also tune live capture with:
+   - `capture_seconds`
+   - `max_frames`
+   - `attempts`
+   - `playback_fps`
+   The default values are intentionally long because the `app_reference_first_6611` profile needs a long first-6611 control window before second-flow media appears.
+4. Install Python packages from `requirements.txt`.
+5. Start the GUI:
+
+```powershell
+python run_gui.py
+```
+
+## Notes
+
+- `SD` maps to `Extra1`
+- `HD` maps to `Main`
+- audio uses G.711 A-law frames from the camera stream
+- the default config is tuned to wait longer for second-handshake media frames than the original short probe setup
+- the player now rolls to the next captured live segment automatically after the current exported HEVC segment finishes
+- if the backend still returns a short or partial run, the GUI keeps the monitor state and lets you reconnect
+
+## Moving To Another Computer
+
+- Clone this repository, then install `ffmpeg` locally or set `ffmpeg_path` to a local executable.
+- Keep `login.txt` next to `desktop_monitor.json`.
+- Leave `agent_client_id` empty in `desktop_monitor.json` so each PC creates its own relay client id.
+- Caches in `xmplayer/config/` are machine-bound. If copied to another PC, `token_cache.json`, `relay_cache.json`, and `agent_client_uuid.txt` are ignored and recreated automatically.
+- To force the legacy fixed `agent_client_id` from config for a one-off test, set `XMPLAYER_USE_CONFIG_AGENT_CLIENT_ID=1` before starting the app.
+- If live video, recordings, or message images do not load on another PC, run `diagnose_xmplayer.cmd`. It writes a short report to `diagnostics.txt`.
+- The other PC must be able to reach the camera cloud/relay hosts and UCloud image URLs. A firewall/VPN/proxy difference can break video, recordings, and message thumbnails at the same time.
+- If another PC can connect to `6611` but every first handshake times out, compare `public ip direct` in `diagnostics.txt`. Some relay paths appear sensitive to the tunnel exit IP.
+- Optional network override: set `XMPLAYER_SOCKS5_PROXY=127.0.0.1:1080` before starting `diagnose_xmplayer.cmd` or `start_xmplayer.cmd` to route both control HTTPS and raw `6611` TCP through the same SOCKS5 proxy.
+- First-6611 relay search can be tuned with `ICSEE_RPSCMD_MAX_ATTEMPTS` and `ICSEE_FIRST6611_HANDSHAKE_TIMEOUT`; defaults are 24 attempts and a 2 second silent-handshake cutoff.

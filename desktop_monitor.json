@@ -1,0 +1,24 @@
+﻿{
+    "device_id":  "",
+    "device_name":  "Camera",
+    "cloud_login_file":  "login.txt",
+    "runtime_mode":  "experimental_current",
+    "controller_profile":  "app_reference_first_6611",
+    "agent_client_id":  "",
+    "default_quality":  "sd",
+    "ffmpeg_path":  "ffmpeg",
+    "capture_seconds":  40.0,
+    "max_frames":  1024,
+    "attempts":  3,
+  "playback_fps":  12.0,
+  "display_mode":  "stacked_split",
+    "window":  {
+                   "width":  1440,
+                   "height":  900,
+                   "start_fullscreen":  false
+               },
+    "paths":  {
+                  "logs_dir":  "logs",
+                  "screenshots_dir":  "screenshots"
+              }
+}

@@ -1,0 +1,1 @@
+"""xmplayer standalone monitor package."""

@@ -1,0 +1,13 @@
+{
+  "bg": "#0d1117",
+  "panel": "#161b22",
+  "surface": "#05070a",
+  "border": "#2b3440",
+  "text": "#e6edf3",
+  "muted": "#8b949e",
+  "accent": "#2ea043",
+  "warn": "#d29922",
+  "danger": "#f85149",
+  "badge_sd": "#1f6feb",
+  "badge_hd": "#2ea043"
+}
