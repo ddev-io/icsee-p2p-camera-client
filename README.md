@@ -5,7 +5,8 @@ Standalone Python desktop monitor GUI for one iCSee/XM camera.
 ## What this project does
 
 - runs the self-contained cloud refresh + first/second 6611 live chain
-- establishes the camera P2P connection through the cloud service
+- signs in through the iCSee/XM cloud service and establishes the camera P2P connection
+- discovers the first camera on the account during initial setup
 - extracts the second-flow media stream
 - decodes video on desktop through a locally installed `ffmpeg`
 - renders frames in a Tkinter monitor window
@@ -22,21 +23,22 @@ You need these installed in the Python/runtime environment used to start the GUI
 
 ## Setup
 
-1. Create `login.txt` next to `desktop_monitor.json`; its first two lines are the login and password you use to sign in to the iCSee/XM mobile app. Do not use the camera's local network login and password. This file is ignored by Git.
-2. Set your camera `device_id` in `desktop_monitor.json`. The published configuration intentionally leaves it empty.
-3. Edit `desktop_monitor.json` if you need another window size or `ffmpeg_path`.
+1. Install Python packages from `requirements.txt`.
+2. Start the GUI:
+
+```powershell
+python run_gui.py
+```
+
+3. On the first start, enter the username or email and password from the iCSee/XM mobile app. Do not use the camera's local network login and password.
+4. The app retrieves the first camera from the cloud account and stores its ID in `desktop_monitor.local.json`. This local file and `login.txt` are ignored by Git.
+5. Edit `desktop_monitor.json` if you need another window size or `ffmpeg_path`.
    You can also tune live capture with:
    - `capture_seconds`
    - `max_frames`
    - `attempts`
    - `playback_fps`
    The default values are intentionally long because the `app_reference_first_6611` profile needs a long first-6611 control window before second-flow media appears.
-4. Install Python packages from `requirements.txt`.
-5. Start the GUI:
-
-```powershell
-python run_gui.py
-```
 
 ## Notes
 
@@ -50,7 +52,8 @@ python run_gui.py
 ## Moving To Another Computer
 
 - Clone this repository, then install `ffmpeg` locally or set `ffmpeg_path` to a local executable.
-- Keep `login.txt` next to `desktop_monitor.json`.
+- On the first run, enter the iCSee/XM app credentials when prompted.
+- `login.txt` and `desktop_monitor.local.json` stay on the local computer and are ignored by Git.
 - Leave `agent_client_id` empty in `desktop_monitor.json` so each PC creates its own relay client id.
 - Caches in `xmplayer/config/` are machine-bound. If copied to another PC, `token_cache.json`, `relay_cache.json`, and `agent_client_uuid.txt` are ignored and recreated automatically.
 - To force the legacy fixed `agent_client_id` from config for a one-off test, set `XMPLAYER_USE_CONFIG_AGENT_CLIENT_ID=1` before starting the app.
