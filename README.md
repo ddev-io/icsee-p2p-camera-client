@@ -5,17 +5,10 @@ Standalone Python desktop monitor GUI for one iCSee/XM camera.
 ## What this project does
 
 - runs the self-contained cloud refresh + first/second 6611 live chain
+- establishes the camera P2P connection through the cloud service
 - extracts the second-flow media stream
-- decrypts `FC` with `VEKEY1` and passes `FD` through as HEVC slices
 - decodes video on desktop through a locally installed `ffmpeg`
 - renders frames in a Tkinter monitor window
-
-## Project rules
-
-- this project is standalone
-- it does not import from `iCSee_v7.7.7_G(77730)_src` at runtime
-- logs stay in `logs/`
-- screenshots stay in `screenshots/`
 
 ## System dependencies
 
@@ -29,7 +22,7 @@ You need these installed in the Python/runtime environment used to start the GUI
 
 ## Setup
 
-1. Create `login.txt` next to `desktop_monitor.json`; its first two lines are your cloud login and password. This file is ignored by Git.
+1. Create `login.txt` next to `desktop_monitor.json`; its first two lines are the login and password you use to sign in to the iCSee/XM mobile app. Do not use the camera's local network login and password. This file is ignored by Git.
 2. Set your camera `device_id` in `desktop_monitor.json`. The published configuration intentionally leaves it empty.
 3. Edit `desktop_monitor.json` if you need another window size or `ffmpeg_path`.
    You can also tune live capture with:
