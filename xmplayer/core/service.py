@@ -1111,6 +1111,37 @@ def _fetch_alarm_storage_count(
     return None, result
 
 
+def discover_cloud_device_ids(config: MonitorConfig, *, timeout: int = 20) -> list[str]:
+    login_issue = validate_cloud_login_file(config.cloud_login_file)
+    if login_issue:
+        raise MonitorCaptureError(login_issue)
+    raw_text = config.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore')
+    extractor, session, _login_attempts, _app_attempts, _login_context = legacy_cli._login_cloud_session_for_rps(
+        text=raw_text,
+        timeout=max(int(timeout), 12),
+        explicit_login='',
+        explicit_password='',
+        login_file=str(config.cloud_login_file),
+        explicit_app_key=legacy_cli.DEFAULT_ICSEE_APP_KEY,
+        ssl_verify=False,
+    )
+    _session, devices, _attempts = extractor.fetch_ams_device_list(
+        session=session,
+        timeout=max(int(timeout), 12),
+        ssl_verify=False,
+    )
+    device_ids: list[str] = []
+    seen: set[str] = set()
+    for device in devices:
+        device_id = str(device.get('_device_id') or device.get('deviceId') or device.get('sn') or '').strip()
+        if device_id and device_id not in seen:
+            seen.add(device_id)
+            device_ids.append(device_id)
+    if not device_ids:
+        raise MonitorCaptureError('No cameras were found for this app account')
+    return device_ids
+
+
 def fetch_monitor_messages(config: MonitorConfig, *, limit: int = 30, timeout: int = 12) -> tuple[list[MonitorMessage], dict[str, Any]]:
     login_issue = validate_cloud_login_file(config.cloud_login_file)
     if login_issue:

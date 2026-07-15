@@ -65,7 +65,11 @@ def validate_cloud_login_file(path: Path) -> str | None:
 
 def load_monitor_config(config_path: str | Path | None = None) -> MonitorConfig:
     project_root = Path(__file__).resolve().parents[2]
-    resolved_config = _resolve_path(project_root, str(config_path or 'desktop_monitor.json'))
+    if config_path is None:
+        local_config = project_root / 'desktop_monitor.local.json'
+        resolved_config = local_config if local_config.exists() else project_root / 'desktop_monitor.json'
+    else:
+        resolved_config = _resolve_path(project_root, str(config_path))
     if not resolved_config.exists():
         raise FileNotFoundError(f'config not found: {resolved_config}')
     raw = json.loads(resolved_config.read_text(encoding='utf-8-sig'))
@@ -100,8 +104,6 @@ def load_monitor_config(config_path: str | Path | None = None) -> MonitorConfig:
         window=window,
         paths=paths,
     )
-    if not cfg.device_id:
-        raise ValueError('device_id is required in desktop_monitor.json')
     if cfg.default_quality not in {'sd', 'hd'}:
         raise ValueError('default_quality must be sd or hd')
     if cfg.agent_client_id and (len(cfg.agent_client_id) != 26 or not cfg.agent_client_id.startswith('c_')):

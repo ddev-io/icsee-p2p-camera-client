@@ -23,6 +23,7 @@ from ..core.service import (
     MonitorMessage,
     RecordingItem,
     describe_capture_failure,
+    discover_cloud_device_ids,
     fetch_device_recordings,
     fetch_monitor_messages,
     run_monitor_live_stream,
@@ -106,6 +107,102 @@ def _show_startup_error(message: str) -> None:
         print(message)
 
 
+def _prompt_for_cloud_credentials(login_path: Path) -> bool:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception as exc:
+        _show_startup_error(f'Unable to show the sign-in window\n\n{exc}')
+        return False
+
+    try:
+        root = tk.Tk()
+    except Exception as exc:
+        _show_startup_error(f'Unable to show the sign-in window\n\n{exc}')
+        return False
+    root.title('Sign in to iCSee / XM')
+    root.configure(bg='#f4f6f8')
+    root.resizable(False, False)
+
+    login_var = tk.StringVar()
+    password_var = tk.StringVar()
+    submitted = {'value': False}
+
+    body = tk.Frame(root, bg='#f4f6f8', padx=28, pady=24)
+    body.pack(fill='both', expand=True)
+    tk.Label(
+        body,
+        text='Sign in to your camera app account',
+        bg='#f4f6f8',
+        fg='#18212b',
+        font=('Segoe UI Semibold', 14),
+    ).pack(anchor='w')
+    tk.Label(
+        body,
+        text='Use the username or email and password from the iCSee/XM mobile app.',
+        bg='#f4f6f8',
+        fg='#52606d',
+        font=('Segoe UI', 9),
+        justify='left',
+        wraplength=360,
+    ).pack(anchor='w', pady=(6, 18))
+
+    tk.Label(body, text='Username or email', bg='#f4f6f8', fg='#34414d', font=('Segoe UI', 9)).pack(anchor='w')
+    login_entry = tk.Entry(body, textvariable=login_var, width=42, font=('Segoe UI', 10))
+    login_entry.pack(fill='x', pady=(4, 14), ipady=5)
+    tk.Label(body, text='Password', bg='#f4f6f8', fg='#34414d', font=('Segoe UI', 9)).pack(anchor='w')
+    password_entry = tk.Entry(body, textvariable=password_var, show='*', width=42, font=('Segoe UI', 10))
+    password_entry.pack(fill='x', pady=(4, 20), ipady=5)
+
+    actions = tk.Frame(body, bg='#f4f6f8')
+    actions.pack(fill='x')
+
+    def cancel() -> None:
+        root.destroy()
+
+    def submit() -> None:
+        login = login_var.get().strip()
+        password = password_var.get()
+        if not login or not password:
+            messagebox.showerror('Sign in required', 'Enter your username or email and password.', parent=root)
+            return
+        try:
+            login_path.parent.mkdir(parents=True, exist_ok=True)
+            login_path.write_text(f'{login}\n{password}\n', encoding='utf-8')
+        except OSError as exc:
+            messagebox.showerror('Could not save sign-in details', str(exc), parent=root)
+            return
+        submitted['value'] = True
+        root.destroy()
+
+    tk.Button(actions, text='Cancel', command=cancel, width=12).pack(side='right')
+    tk.Button(actions, text='Sign in', command=submit, width=12, default='active').pack(side='right', padx=(0, 8))
+    root.protocol('WM_DELETE_WINDOW', cancel)
+    root.bind('<Return>', lambda _event: submit())
+    root.bind('<Escape>', lambda _event: cancel())
+    login_entry.focus_set()
+    root.mainloop()
+    return bool(submitted['value'])
+
+
+def _save_device_id(config_path: Path, device_id: str) -> None:
+    clean_device_id = str(device_id or '').strip()
+    if not clean_device_id:
+        raise ValueError('device ID is empty')
+    raw = json.loads(config_path.read_text(encoding='utf-8-sig'))
+    if not isinstance(raw, dict):
+        raise ValueError('desktop_monitor.json must contain an object')
+    raw['device_id'] = clean_device_id
+    local_config_path = config_path.with_name('desktop_monitor.local.json')
+    temporary_path = local_config_path.with_suffix(local_config_path.suffix + '.tmp')
+    try:
+        temporary_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        temporary_path.replace(local_config_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def _fit_size(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int]:
     if src_w <= 0 or src_h <= 0 or box_w <= 0 or box_h <= 0:
         return max(box_w, 1), max(box_h, 1)
@@ -150,6 +247,25 @@ def main() -> int:
     except Exception as exc:
         _show_startup_error(f'Failed to load desktop_monitor.json\n\n{exc}')
         return 1
+
+    login_issue = validate_cloud_login_file(config.cloud_login_file)
+    if login_issue:
+        if not _prompt_for_cloud_credentials(config.cloud_login_file):
+            return 1
+        try:
+            config = load_monitor_config()
+        except Exception as exc:
+            _show_startup_error(f'Failed to load desktop_monitor.json\n\n{exc}')
+            return 1
+
+    if login_issue or not config.device_id:
+        try:
+            device_ids = discover_cloud_device_ids(config)
+            _save_device_id(config.config_path, device_ids[0])
+            config = load_monitor_config()
+        except Exception as exc:
+            _show_startup_error(f'Unable to load a camera from this account\n\n{exc}')
+            return 1
 
     issues = _startup_issues(config)
     if issues:
