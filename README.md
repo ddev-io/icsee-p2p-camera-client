@@ -42,6 +42,10 @@ python run_gui.py
 
 ## Notes
 
+- **Camera Wi-Fi** opens a network settings window. Refresh reads `NetWork.Wifi` and asks the camera to scan nearby networks with `WifiAP` (command 1020). Choose a network from the camera's list and enter its Wi-Fi password. The SSID and security type come from the selected row; there is no manual SSID input. **Connect camera** sends the new settings after confirmation and stops video while the camera changes networks. Other network configuration fields are preserved. If scanning fails or returns no networks, connecting is disabled until a fresh scan succeeds.
+- Wi-Fi settings use the existing cloud/P2P connection; a connected Android phone, ADB, and Frida are not required. The password is not saved to a local file. If the camera disconnects before acknowledging the write, the program reports an unconfirmed save and requires a fresh settings read before another attempt.
+- The Wi-Fi commands follow the [FunSDK network settings example](https://github.com/jlinklab/jlink-funsdk-android-demo/blob/main/app/src/main/java/demo/xm/com/xmfunsdkdemo/ui/device/config/networksetting/presenter/NetworkSettingPresenter.java). Actual network switching must be verified on the target camera; local tests do not establish that it successfully joined the new network.
+
 - `SD` maps to `Extra1`
 - `HD` maps to `Main`
 - audio uses G.711 A-law frames from the camera stream

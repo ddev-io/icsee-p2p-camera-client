@@ -274,6 +274,7 @@ def main() -> int:
 
     import tkinter as tk
     from PIL import Image, ImageTk
+    from .wifi import CameraWifiDialog
 
     palette = _load_palette(config)
 
@@ -341,6 +342,7 @@ def main() -> int:
             self._message_viewer: Any | None = None
             self._message_viewer_key: tuple[int, int] | None = None
             self._message_viewer_photo: Any | None = None
+            self._wifi_dialog: CameraWifiDialog | None = None
             self._message_viewer_source: Any | None = None
             self._message_viewer_label: Any | None = None
             self._message_viewer_zoom = 1.0
@@ -424,6 +426,14 @@ def main() -> int:
                 )
                 btn.pack(side='left', padx=(0, 8))
                 self._section_buttons[key] = btn
+
+            tk.Button(
+                tabbar, text='Camera Wi-Fi', command=self._open_wifi_settings,
+                relief='flat', bd=0, padx=20, pady=10,
+                bg=self.palette['panel'], fg=self.palette['text'],
+                activebackground=self.palette['border'], activeforeground=self.palette['text'],
+                font=('Segoe UI Semibold', 11),
+            ).pack(side='right')
 
             self.section_host = tk.Frame(self, bg=self.palette['bg'])
             self.section_host.pack(fill='both', expand=True, padx=18, pady=(0, 18))
@@ -549,6 +559,15 @@ def main() -> int:
             self._section_pages['recordings'] = self._build_recordings_page(self.section_host)
             self._section_pages['messages'] = self._build_messages_page(self.section_host)
             self._show_section('live')
+
+        def _open_wifi_settings(self) -> None:
+            if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
+                self._wifi_dialog.lift()
+                self._wifi_dialog.focus_set()
+                return
+            self._wifi_dialog = CameraWifiDialog(
+                self, self.config_data, self.palette, before_save=self._on_stop,
+            )
 
         def _build_ptz_panel(self) -> None:
             button_style = {
@@ -1934,6 +1953,8 @@ def main() -> int:
 
         def _on_close(self) -> None:
             self._closing = True
+            if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
+                self._wifi_dialog.close()
             self._close_message_image()
             self._cancel_restart_timer()
             self._restart_pending = False
