@@ -291,15 +291,30 @@ def _summarize_agent_protocol(result: dict[str, Any]) -> dict[str, Any]:
     selected = agent_http.get('selected') if isinstance(agent_http.get('selected'), dict) else {}
     parsed = selected.get('parsed') if isinstance(selected.get('parsed'), dict) else {}
     errors = []
-    for attempt in attempts[:3]:
+    responses = []
+    # Bound the report, but always retain the selected response even if a
+    # successful retry appears after the first 32 HTTP attempts.
+    rows = list(enumerate(attempts, 1))
+    if selected and not any(attempt == selected for _, attempt in rows):
+        rows.append((len(attempts) + 1, selected))
+    for index, attempt in rows:
         if not isinstance(attempt, dict):
             continue
-        error_source = attempt.get('error')
-        if not error_source and not attempt.get('ok'):
-            error_source = attempt.get('response_head')
-        error = _short_error(error_source)
-        if error:
+        diagnostic = attempt.get('response_diagnostics')
+        if not isinstance(diagnostic, dict):
+            continue
+        error = diagnostic.get('transport_error')
+        if not error and str(diagnostic.get('error_num') or '') not in {'', '0', '100', '200'}:
+            error = diagnostic.get('error_string') or f"AgentProtocol ErrorNum={diagnostic['error_num']}"
+        if error and len(errors) < 3:
             errors.append(error)
+        is_selected = bool(selected and attempt == selected)
+        if len(responses) < 32 or is_selected:
+            responses.append({
+                'index': index, 'selected': is_selected,
+                'http_status': attempt.get('status'), 'http_ok': bool(attempt.get('ok')),
+                **diagnostic,
+            })
     out: dict[str, Any] = {
         'attempts': len(attempts),
         'selected': bool(parsed.get('agent_server_ip') and parsed.get('agent_server_port')),
@@ -308,6 +323,8 @@ def _summarize_agent_protocol(result: dict[str, Any]) -> dict[str, Any]:
             if parsed.get('agent_server_ip') and parsed.get('agent_server_port')
             else ''
         ),
+        'responses': responses,
+        'responses_omitted': max(len(attempts) - len(responses), 0),
     }
     if errors:
         out['errors'] = errors
@@ -316,11 +333,14 @@ def _summarize_agent_protocol(result: dict[str, Any]) -> dict[str, Any]:
 
 def _summarize_agent_server(result: dict[str, Any]) -> dict[str, Any]:
     server = result.get('agent_server') if isinstance(result.get('agent_server'), dict) else {}
+    agent_http = result.get('agent_http') if isinstance(result.get('agent_http'), dict) else {}
+    selected = agent_http.get('selected') if isinstance(agent_http.get('selected'), dict) else {}
+    diagnostic = selected.get('response_diagnostics')
     ip = str(server.get('ip') or '').strip()
     port = int(server.get('port') or 0)
     return {
         'server': f'{ip}:{port}' if ip and port else '',
-        'protocol_mode': str(server.get('protocol_mode') or '').strip(),
+        'protocol_mode': diagnostic.get('protocol_mode', '') if isinstance(diagnostic, dict) else '',
     }
 
 
@@ -599,13 +619,9 @@ def _detect_failure_stage(result: dict[str, Any]) -> dict[str, Any]:
     selected = agent_http.get('selected') if isinstance(agent_http.get('selected'), dict) else {}
     parsed = selected.get('parsed') if isinstance(selected.get('parsed'), dict) else {}
     if not parsed.get('agent_server_ip') or not parsed.get('agent_server_port'):
-        attempts = agent_http.get('attempts') if isinstance(agent_http.get('attempts'), list) else []
-        first_error = ''
-        for attempt in attempts:
-            if isinstance(attempt, dict):
-                first_error = _short_error(attempt.get('error') or attempt.get('response_head'))
-                if first_error:
-                    break
+        # Raw response_head can contain relay keys or echoed credentials.
+        errors = _summarize_agent_protocol(result).get('errors') or []
+        first_error = errors[0] if errors else ''
         return {
             'stage': 'agent_protocol_6510',
             'detail': first_error or 'AgentProtocol did not return a 6611 relay',
@@ -2051,6 +2067,8 @@ def run_monitor_capture(
     timeout: int | None = None,
     capture_seconds: float | None = None,
     max_frames: int | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+    include_agent_response_metadata: bool = False,
 ) -> CaptureArtifacts:
     _raise_if_cancelled(stop_event)
     raw_text = ''
@@ -2081,6 +2099,7 @@ def run_monitor_capture(
         refresh_timeout=refresh_timeout,
         runtime_mode=runtime_mode,
         status_callback=status_callback,
+        progress_callback=progress_callback,
     )
 
     _raise_if_cancelled(stop_event)
@@ -2100,6 +2119,7 @@ def run_monitor_capture(
         _raise_if_cancelled(stop_event)
         state = 'Connecting' if attempt_index == 1 else 'Retrying'
         _emit_status(status_callback, state, f'Live attempt {attempt_index}/{attempt_count}')
+        _emit_progress(progress_callback, f'Live attempt {attempt_index}/{attempt_count} request')
         session_id = legacy_api.build_session_id()
         result = chain.run(
             serial_number=serial_number,
@@ -2153,6 +2173,8 @@ def run_monitor_capture(
             wakeup_port=0,
             runtime_mode=runtime_mode,
             stop_event=stop_event,
+            progress_callback=progress_callback,
+            include_agent_response_metadata=include_agent_response_metadata,
         )
         result['attempt_index'] = attempt_index
         result['quality'] = quality

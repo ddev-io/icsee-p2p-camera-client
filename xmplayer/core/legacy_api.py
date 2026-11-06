@@ -33,6 +33,7 @@ except Exception:  # noqa: BLE001
     _RSA = None
 
 from .legacy_parsers import extract_possible_stream_urls
+from .agent_diagnostics import summarize_agent_response
 from .legacy_signature import SignedHeadersInput, build_signed_headers, compute_signature
 from .ptz import build_binary_ptz_followup
 
@@ -753,6 +754,9 @@ def select_agent_server_via_query(
                     "service_type": payload_body.get("ServiceType"),
                     "step": payload_body.get("Step"),
                     "parsed": parsed,
+                    "response_diagnostics": summarize_agent_response(
+                        response.json_data, request_payload=payload, transport_error=response.error,
+                    ),
                     "response_head": (response.text or "")[:400],
                     "error": response.error,
                 }
@@ -6083,6 +6087,7 @@ class RpsLiveChain:
         plain_handoff_extend_on_activity: bool = False,
         dynamic_followup_queue: Any | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        include_agent_response_metadata: bool = False,
     ) -> dict[str, Any]:
         normalized_runtime_mode = str(runtime_mode or "baseline_20260323").strip() or "baseline_20260323"
         baseline_runtime = normalized_runtime_mode == "baseline_20260323"
@@ -6272,10 +6277,17 @@ class RpsLiveChain:
                         "content_type": content_type,
                         "service_type": payload_body.get("ServiceType"),
                         "parsed": agent_parsed,
+                        "response_diagnostics": summarize_agent_response(
+                            agent_res.json_data, request_payload=agent_payload, transport_error=agent_res.error,
+                        ),
                         "response_head": (agent_res.text or "")[:400],
                         "error": agent_res.error,
                     }
                     agent_attempts.append(attempt)
+                    if include_agent_response_metadata:
+                        _emit_progress('AgentProtocol response metadata ' + json.dumps(
+                            attempt['response_diagnostics'], ensure_ascii=False, separators=(',', ':'),
+                        ))
                     if agent_parsed.get("agent_server_ip") and agent_parsed.get("agent_server_port"):
                         agent_pick = attempt
                         break
@@ -6473,6 +6485,10 @@ class RpsLiveChain:
                                         "content_type": content_type,
                                         "service_type": payload_body.get("ServiceType"),
                                         "parsed": retry_parsed,
+                                        "response_diagnostics": summarize_agent_response(
+                                            retry_res.json_data, request_payload=retry_payload,
+                                            transport_error=retry_res.error,
+                                        ),
                                         "response_head": (retry_res.text or "")[:400],
                                         "error": retry_res.error,
                                         "selector_attempt_index": enc_attempt_index + 1,
@@ -6481,6 +6497,10 @@ class RpsLiveChain:
                                     }
                                     agent_attempts.append(retry_attempt)
                                     retry_attempts.append(retry_attempt)
+                                    if include_agent_response_metadata:
+                                        _emit_progress('AgentProtocol response metadata ' + json.dumps(
+                                            retry_attempt['response_diagnostics'], ensure_ascii=False, separators=(',', ':'),
+                                        ))
                                     if retry_parsed.get("agent_server_ip") and retry_parsed.get("agent_server_port"):
                                         retry_pick = retry_attempt
                                         break

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
+import queue
 import shutil
 import socket
 import ssl
@@ -134,6 +137,34 @@ def _emit_live_probe_details(rows: list[str], root: Path, result: dict) -> dict:
         f"selected={protocol.get('selected')} attempts={protocol.get('attempts')} "
         f"server={server or '-'} mode={server_info.get('protocol_mode') or '-'}",
     )
+    responses = protocol.get('responses') if isinstance(protocol.get('responses'), list) else []
+    for response in responses:
+        random_info = response.get('random_str') or {}
+        length = random_info.get('length')
+        _emit(
+            rows, root,
+            f"INFO AgentProtocol response #{response.get('index')}: "
+            f"selected={response.get('selected')} http={response.get('http_status')} "
+            f"ok={response.get('http_ok')} "
+            f"message={json.dumps(response.get('message_type') or '', ensure_ascii=False)} "
+            f"ErrorNum={json.dumps(response.get('error_num') or '', ensure_ascii=False)} "
+            f"ErrorString={json.dumps(response.get('error_string') or '', ensure_ascii=False)} "
+            f"ProtocolMode={json.dumps(response.get('protocol_mode') or '', ensure_ascii=False)} "
+            f"RandomStr.present={random_info.get('present')} "
+            f"RandomStr.type={random_info.get('type') or 'missing'} "
+            f"RandomStr.length={length if length is not None else '-'}",
+        )
+        _emit(
+            rows, root,
+            f"INFO AgentProtocol fields #{response.get('index')}: "
+            f"types={response.get('response_type')}/{response.get('agent_type')}/"
+            f"{response.get('header_type')}/{response.get('body_type')} "
+            + json.dumps(response.get('fields') or {}, ensure_ascii=False),
+        )
+        if response.get('transport_error'):
+            _emit(rows, root, f"INFO AgentProtocol transport #{response.get('index')}: {response['transport_error']}")
+    if protocol.get('responses_omitted'):
+        _emit(rows, root, f"INFO AgentProtocol: {protocol['responses_omitted']} additional responses omitted")
     if server and ':' in server:
         host, port = server.rsplit(':', 1)
         if port.isdigit():
@@ -178,6 +209,82 @@ def _emit_live_probe_details(rows: list[str], root: Path, result: dict) -> dict:
             f"frames={_compact_dict(second.get('frames'), limit=120) or '-'}",
         )
     return details
+
+
+def _live_control_probe_worker(config, events, rotate_client: bool) -> None:
+    # A separate process lets the report stop even if DNS or a socket call
+    # ignores the cooperative stop_event. Only this worker is terminated.
+    if rotate_client:
+        os.environ['ICSEE_ROTATE_AGENT_CLIENT_ON_RETRY'] = '1'
+    try:
+        capture = run_monitor_capture(
+            config, quality=config.default_quality, attempts=1,
+            timeout=8, capture_seconds=6.0, max_frames=32,
+            progress_callback=lambda detail: events.put(('progress', detail)),
+            include_agent_response_metadata=True,
+        )
+        events.put(('result', capture.result))
+    except Exception as exc:
+        detail = legacy_api.summarize_agent_response(
+            None, transport_error=f'{type(exc).__name__}: {exc}',
+        )['transport_error']
+        events.put(('error', detail))
+
+
+def _run_live_control_probe(config, rows: list[str], root: Path, *, rotate_client: bool = False) -> dict:
+    context = multiprocessing.get_context('spawn')
+    events = context.Queue()
+    process = context.Process(
+        target=_live_control_probe_worker, args=(config, events, rotate_client), daemon=True,
+    )
+    limit = 70.0
+    started = time.monotonic()
+    last_update = started
+    last_stage = 'starting worker'
+    process_started = False
+    try:
+        process.start()
+        process_started = True
+        while True:
+            now = time.monotonic()
+            remaining = limit - (now - started)
+            if remaining <= 0:
+                raise TimeoutError(
+                    f'{limit:.0f}s limit reached; worker stopped. '
+                    f'Last stage: {last_stage}. Partial diagnostics have been saved.'
+                )
+            try:
+                kind, value = events.get(timeout=min(2.0, remaining))
+            except queue.Empty:
+                if not process.is_alive():
+                    raise RuntimeError(f'live probe worker exited with code {process.exitcode} without a result')
+                now = time.monotonic()
+                if now - last_update >= 10.0:
+                    _emit(rows, root, f'INFO live progress {now - started:.1f}s: waiting; last stage: {last_stage}')
+                    last_update = now
+                continue
+            if kind == 'result':
+                return value
+            if kind == 'error':
+                raise RuntimeError(value)
+            if kind == 'progress':
+                # Metadata is already allowlisted/redacted by the transport.
+                # Preserve it immediately if the later TCP probe times out.
+                if not value.startswith('AgentProtocol response metadata '):
+                    last_stage = value
+                _emit(rows, root, f'INFO live progress {time.monotonic() - started:.1f}s: {value}')
+                last_update = time.monotonic()
+    finally:
+        if process_started:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=3.0)
+            if not process.is_alive():
+                process.close()
+        events.close()
 
 
 def main() -> int:
@@ -312,69 +419,28 @@ def main() -> int:
             _emit(rows, root, _fail('cloud token/status', str(exc)))
 
         try:
-            _emit(rows, root, 'RUN  live control probe...')
-            live_stop = threading.Event()
-            timer = threading.Timer(70.0, live_stop.set)
-            timer.daemon = True
-            timer.start()
-            capture = run_monitor_capture(
-                cfg,
-                quality=cfg.default_quality,
-                attempts=1,
-                stop_event=live_stop,
-                timeout=8,
-                capture_seconds=6.0,
-                max_frames=32,
-            )
-            timer.cancel()
-            failure = describe_capture_failure(capture.result)
+            _emit(rows, root, 'RUN  live control probe (70s limit, progress updates)...')
+            result = _run_live_control_probe(cfg, rows, root)
+            failure = describe_capture_failure(result)
             if failure:
                 _emit(rows, root, _fail('live control probe', failure))
-                details = _emit_live_probe_details(rows, root, capture.result)
+                details = _emit_live_probe_details(rows, root, result)
                 if not _details_have_handshake(details):
-                    previous_rotate = os.environ.get('ICSEE_ROTATE_AGENT_CLIENT_ON_RETRY')
-                    os.environ['ICSEE_ROTATE_AGENT_CLIENT_ON_RETRY'] = '1'
                     try:
-                        _emit(rows, root, 'RUN  live control probe rotating-client-token...')
-                        rotate_stop = threading.Event()
-                        rotate_timer = threading.Timer(70.0, rotate_stop.set)
-                        rotate_timer.daemon = True
-                        rotate_timer.start()
-                        rotate_capture = run_monitor_capture(
-                            cfg,
-                            quality=cfg.default_quality,
-                            attempts=1,
-                            stop_event=rotate_stop,
-                            timeout=8,
-                            capture_seconds=6.0,
-                            max_frames=32,
-                        )
-                        rotate_timer.cancel()
-                        rotate_failure = describe_capture_failure(rotate_capture.result)
+                        _emit(rows, root, 'RUN  live control probe rotating-client-token (70s limit, progress updates)...')
+                        rotate_result = _run_live_control_probe(cfg, rows, root, rotate_client=True)
+                        rotate_failure = describe_capture_failure(rotate_result)
                         if rotate_failure:
                             _emit(rows, root, _fail('live control probe rotating-client-token', rotate_failure))
                         else:
                             _emit(rows, root, _ok('live control probe rotating-client-token', 'first/second 6611 returned media-capable result'))
-                        _emit_live_probe_details(rows, root, rotate_capture.result)
+                        _emit_live_probe_details(rows, root, rotate_result)
                     except Exception as exc:
-                        try:
-                            rotate_timer.cancel()
-                        except Exception:
-                            pass
                         _emit(rows, root, _fail('live control probe rotating-client-token', str(exc)))
-                    finally:
-                        if previous_rotate is None:
-                            os.environ.pop('ICSEE_ROTATE_AGENT_CLIENT_ON_RETRY', None)
-                        else:
-                            os.environ['ICSEE_ROTATE_AGENT_CLIENT_ON_RETRY'] = previous_rotate
             else:
                 _emit(rows, root, _ok('live control probe', 'first/second 6611 returned media-capable result'))
-                _emit_live_probe_details(rows, root, capture.result)
+                _emit_live_probe_details(rows, root, result)
         except Exception as exc:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
             _emit(rows, root, _fail('live control probe', str(exc)))
 
         try:
@@ -428,4 +494,5 @@ def _finish(rows: list[str], root: Path) -> int:
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     raise SystemExit(main())
