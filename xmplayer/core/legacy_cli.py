@@ -5,12 +5,14 @@ import base64
 import getpass
 import html
 import json
+import os
 import re
 import socket
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from .ams_regions import AmsCache, credential_identity, normalize_ams_base
 
 from .legacy_api import (
     AgentTcpEncryptedClaimProbe,
@@ -37,6 +39,7 @@ from .legacy_api import (
     _decode_base64_with_suffix,
     _recv_base64_message,
     _summarize_handshake_reply,
+    _is_token_error,
     parse_agent_protocol_response,
     parse_status_protocol_response,
     status_protocol_query,
@@ -221,6 +224,13 @@ def _default_ams_preauth_context(app_key: str) -> dict[str, Any]:
 
 def _split_handshake_text(raw_text: str) -> dict[str, Any]:
     text = str(raw_text or "")
+    terminator = ''
+    if text.endswith('XXEE'):
+        try:
+            text = base64.b64decode(text[:-4], validate=True).decode('utf-8')
+            terminator = 'XXEE'
+        except (ValueError, UnicodeDecodeError):
+            pass
     suffix_text = ""
     if text.endswith("]q\x04"):
         suffix_text = "]q\x04"
@@ -235,6 +245,7 @@ def _split_handshake_text(raw_text: str) -> dict[str, Any]:
         "serial": parts[2] if len(parts) >= 3 else "",
         "session": parts[3] if len(parts) >= 4 else "",
         "suffix_text": suffix_text,
+        "wire_terminator": terminator,
         "suffix_hex": suffix_text.encode("utf-8", errors="ignore").hex() if suffix_text else "",
         "wire_len": len(str(raw_text or "").encode("utf-8", errors="ignore")),
         "text_len": len(text.encode("utf-8", errors="ignore")),
@@ -371,7 +382,7 @@ def _probe_first_6611_handshake(
     sent_info = {
         "sent_b64": handshake_b64.decode("ascii", errors="ignore"),
         "sent_text": handshake_text,
-        "sent_wire_text": (handshake_text.encode("utf-8") + probe.suffix).decode("utf-8", errors="backslashreplace"),
+        "sent_wire_text": handshake_b64.decode('ascii'),
         "sent_suffix_hex": probe.suffix.hex(),
     }
     result: dict[str, Any] = {
@@ -655,6 +666,8 @@ def _login_cloud_session_for_rps(
     explicit_password: str = "",
     login_file: str = DEFAULT_CLOUD_LOGIN_FILE,
     ssl_verify: bool = True,
+    explicit_ams_base: str = "",
+    target_serial: str = "",
 ) -> tuple[CloudLiveExtractor, Any, list[Any], list[Any], dict[str, Any]]:
     extractor = CloudLiveExtractor()
     resolved_app_key = str(explicit_app_key or "").strip()
@@ -677,23 +690,30 @@ def _login_cloud_session_for_rps(
         explicit_app_key=resolved_app_key,
         ssl_verify=ssl_verify,
     )
-    session, login_attempts = extractor.login_with_ams_credentials(
-        account=login,
-        password=password,
-        app_key=str(preauth_session.app_key or resolved_app_key),
-        uuid=str(preauth_session.uuid or DEFAULT_ICSEE_UUID),
-        secret=str(preauth_session.secret or ""),
-        move_card=int(preauth_session.move_card or 0),
-        vendor=str(preauth_session.vendor or ""),
-        timeout=timeout,
-        ssl_verify=ssl_verify,
-    )
+    override = normalize_ams_base(explicit_ams_base or os.environ.get('XMPLAYER_AMS_BASE', ''))
+    cache = AmsCache(credential_identity(login, password, resolved_app_key, override))
+    extractor.ams_cache = cache
+    extractor.ams_base_override = override
+    extractor.ams_preferred_base = cache.preferred_region(target_serial)
+    login_kwargs = dict(account=login, password=password, app_key=str(preauth_session.app_key or resolved_app_key),
+                        uuid=str(preauth_session.uuid or DEFAULT_ICSEE_UUID), secret=str(preauth_session.secret or ''),
+                        move_card=int(preauth_session.move_card or 0), vendor=str(preauth_session.vendor or ''),
+                        timeout=timeout, ssl_verify=ssl_verify)
+    extractor._last_login_kwargs = dict(mode='ams_password', **login_kwargs)
+    cached = cache.load_session()
+    if cached:
+        session = CloudAuthSession(account=login, **cached)
+        login_attempts = []
+    else:
+        session, login_attempts = extractor.login_with_ams_credentials(**login_kwargs)
     mode = "ams_password"
     app_attempts: list[Any] = []
     info = {
         "login_mode": mode,
         "login_source": login_info,
         "app_key": str(session.app_key or resolved_app_key or "").strip(),
+        "session_cached": bool(cached),
+        "ams_base": session.ams_base or session.ams_login_base,
         "bootstrap_context": bootstrap_context,
         "bootstrap_login_attempts": _summarize_http_attempts(bootstrap_login_attempts),
         "bootstrap_app_attempts": _summarize_http_attempts(bootstrap_app_attempts),
@@ -713,6 +733,7 @@ def _refresh_admin_token_for_rps(
     login_file: str = DEFAULT_CLOUD_LOGIN_FILE,
     explicit_app_key: str = "",
     ssl_verify: bool = True,
+    explicit_ams_base: str = "",
 ) -> tuple[str, dict[str, Any]]:
     jvss_base = (explicit_jvss_base or extract_default_jvss_url(text) or "").strip()
     refresh_info: dict[str, Any] = {
@@ -729,6 +750,8 @@ def _refresh_admin_token_for_rps(
         explicit_password=explicit_password,
         login_file=login_file,
         ssl_verify=ssl_verify,
+        explicit_ams_base=explicit_ams_base,
+        target_serial=serial_number,
     )
     uuid_source = "login_session"
     if not session.uuid:
@@ -742,10 +765,20 @@ def _refresh_admin_token_for_rps(
         jvss_bases=[jvss_base] if jvss_base else None,
         ssl_verify=ssl_verify,
     )
+    if not session.device_token and any(row.status == 401 or _is_token_error(row) for row in jvss_attempts):
+        session, refresh_attempts = extractor.refresh_session(timeout=timeout)
+        login_attempts.extend(refresh_attempts)
+        session, retried = extractor.fetch_jvss_device_login_token(
+            session=session, device_id=serial_number, timeout=timeout, is_latest=True,
+            jvss_bases=[jvss_base] if jvss_base else None, ssl_verify=ssl_verify,
+        )
+        jvss_attempts.extend(retried)
     refresh_info.update(
         {
             "auth_chain_mode": str(login_context.get("login_mode") or ""),
             "auth_chain_source": login_context.get("login_source") or {},
+            "ams_base": session.ams_base or session.ams_login_base,
+            "session_cached": login_context.get('session_cached', False),
             "app_key": str(login_context.get("app_key") or ""),
             "uuid": session.uuid,
             "vendor": session.vendor,
@@ -779,9 +812,9 @@ def _refresh_authcode_for_rps(
     refresh_info: dict[str, Any] = {
         "attempted": True,
         "mode": (
-            "ams_msdlist_then_acapp_fallback"
+            "ams_region_then_msdlist"
             if normalized_refresh_mode == RPS_CHAIN_RUNTIME_BASELINE
-            else "acapp_then_ams_msdlist"
+            else "ams_region_then_acapp"
         ),
         "ams_base": explicit_ams_base or "default",
     }
@@ -794,13 +827,18 @@ def _refresh_authcode_for_rps(
         explicit_password=explicit_password,
         login_file=login_file,
         ssl_verify=ssl_verify,
+        explicit_ams_base=explicit_ams_base,
+        target_serial=serial_number,
+    )
+    session, devices, ams_attempts = extractor.fetch_ams_device_list(
+        session=session, timeout=timeout, serial_number=serial_number, ssl_verify=ssl_verify,
     )
     session, acapp_rows, acapp_attempts = extractor.fetch_acapp_auth_list(
         session=session,
         serial_number=serial_number,
         auth_type="rps",
         timeout=timeout,
-        ams_bases=[explicit_ams_base] if explicit_ams_base else None,
+        ams_bases=[session.ams_base] if devices else None,
         ssl_verify=ssl_verify,
     )
     acapp_match = next(
@@ -823,12 +861,6 @@ def _refresh_authcode_for_rps(
         or acapp_match.get("rps")
         or ""
     ).strip()
-    session, devices, ams_attempts = extractor.fetch_ams_device_list(
-        session=session,
-        timeout=timeout,
-        ams_bases=[explicit_ams_base] if explicit_ams_base else None,
-        ssl_verify=ssl_verify,
-    )
     matched = next((row for row in devices if str(row.get("_device_id") or "") == serial_number), {})
     ams_authcode = str(matched.get("rps") or "").strip()
     if normalized_refresh_mode == RPS_CHAIN_RUNTIME_BASELINE:
@@ -845,6 +877,8 @@ def _refresh_authcode_for_rps(
         {
             "auth_chain_mode": str(login_context.get("login_mode") or ""),
             "auth_chain_source": login_context.get("login_source") or {},
+            "ams_base": session.ams_base or session.ams_login_base,
+            "session_cached": login_context.get('session_cached', False),
             "app_key": str(login_context.get("app_key") or ""),
             "source": refresh_source,
             "uuid": session.uuid,

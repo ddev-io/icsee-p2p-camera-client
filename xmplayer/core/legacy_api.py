@@ -34,6 +34,7 @@ except Exception:  # noqa: BLE001
 
 from .legacy_parsers import extract_possible_stream_urls
 from .agent_diagnostics import summarize_agent_response
+from .ams_regions import AMS_BASES, AmsCache, ams_candidates, normalize_ams_base
 from .legacy_signature import SignedHeadersInput, build_signed_headers, compute_signature
 from .ptz import build_binary_ptz_followup
 
@@ -72,9 +73,7 @@ DEFAULT_JVSS_BASES = [
     "https://eu-jvss.xmcsrv.net",
     "https://af-jvss.xmcsrv.net",
 ]
-DEFAULT_AMS_BASES = [
-    "https://eu-ams.jftechws.com",
-]
+DEFAULT_AMS_BASES = list(AMS_BASES)
 DEFAULT_AMS_USER_AGENT = "BQ-5056_Android_24_7321775314150220_iCSee_7.7.9_G_77930_v1.6.9"
 MEDIA_PAYLOAD_B64_LIMIT = 1024
 MEDIA_FRAME_SUMMARY_LIMIT = 1024
@@ -1037,15 +1036,21 @@ def _extract_acapp_auth_rows(payload: Any) -> list[dict[str, Any]]:
 
 TCP_MAGIC = b"\xFF\x01"
 TCP_HEADER_LEN = 20
-TCP_HANDSHAKE_SUFFIX = b"]q\x04"
+# AgentLib terminates the Base64 text on the wire with XXEE. Encoding its
+# decoded bytes (]q\x04) inside the payload only works at certain alignments.
+TCP_HANDSHAKE_SUFFIX = b""
 TCP_BASE64_BYTES = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 SPECIAL_LOGIN_AES_KEY = b"dashoiahfarqdasr"
 WAKEUP_SUFFIX = b"XXEE"
 
 
-def _format_handshake_wire_text(text: str, suffix: bytes) -> str:
+def _build_agent_handshake_wire(text: str, suffix: bytes = b"") -> bytes:
     raw = str(text or "").encode("utf-8") + bytes(suffix or b"")
-    return raw.decode("utf-8", errors="backslashreplace")
+    return base64.b64encode(raw) + WAKEUP_SUFFIX
+
+
+def _format_handshake_wire_text(text: str, suffix: bytes) -> str:
+    return _build_agent_handshake_wire(text, suffix).decode('ascii')
 
 
 @dataclass
@@ -1099,21 +1104,21 @@ def _decode_base64_with_suffix(raw_b64: bytes, suffix: bytes) -> tuple[bytes | N
             last_error = "b64_length"
             continue
         try:
-            decoded = base64.b64decode(candidate)
+            decoded = base64.b64decode(candidate, validate=True)
             break
         except Exception as exc:  # noqa: BLE001
             last_error = f"b64_decode:{exc}"
     if decoded is None:
         return None, last_error or "b64_decode"
-    if not decoded.endswith(suffix):
-        # Some first-6611 handshake replies decode to plain JSON without the
-        # client-side ]q\\x04 suffix even though they are still valid base64
-        # messages on the wire (for example eyJ...XXEE -> {"ErrorNum":...}).
-        trimmed = decoded.strip()
-        if trimmed[:1] in (b"{", b"[") and trimmed[-1:] in (b"}", b"]"):
-            return decoded, ""
-        return None, "b64_suffix"
-    return decoded, ""
+    if suffix and decoded.endswith(suffix):
+        return decoded, ""
+    try:
+        payload = json.loads(decoded.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        return decoded, ""
+    return None, "unexpected_handshake_payload"
 
 
 def _recv_base64_message(
@@ -1135,15 +1140,40 @@ def _recv_base64_message(
         buffer += chunk
         if len(buffer) > max_bytes:
             break
+        # XXEE consists of Base64 characters too. Consume it explicitly,
+        # including when it arrives separately from the JSON acknowledgement.
+        marker_offset = 0
+        while True:
+            marker_offset = buffer.find(WAKEUP_SUFFIX, marker_offset)
+            if marker_offset < 0:
+                break
+            end = marker_offset + len(WAKEUP_SUFFIX)
+            wire = buffer[:end]
+            decoded, _ = _decode_base64_with_suffix(wire, suffix)
+            if decoded is not None:
+                return wire, buffer[end:], ""
+            marker_offset += 1
+        if not suffix:
+            continue
+        # Explicit interior suffixes retain support for older framing. A
+        # suffix-free JSON reply must still wait for its wire terminator.
         b64_prefix, remainder = _split_base64_prefix(buffer)
         if len(b64_prefix) < 4:
             continue
         decoded, err = _decode_base64_with_suffix(b64_prefix, suffix)
-        if decoded is not None:
+        if decoded is not None and decoded.endswith(suffix):
             return b64_prefix, remainder, ""
         if remainder:
-            return b64_prefix, remainder, err
+            return b"", buffer, err or "missing_handshake_terminator"
     return b"", buffer, "timeout"
+
+
+def _agent_handshake_error(parsed: dict[str, Any]) -> str:
+    payload = parsed.get('json')
+    if not isinstance(payload, dict) or 'ErrorNum' not in payload:
+        return 'invalid_agent_handshake_ack'
+    code = _intish(payload.get('ErrorNum'), -1)
+    return '' if code == 200 else f'agent_handshake_rejected:ErrorNum={code}'
 
 
 def _summarize_handshake_reply(b64_resp: bytes, parsed: dict[str, Any]) -> dict[str, Any]:
@@ -3050,11 +3080,10 @@ class AgentTcpLiveProbe:
         self.suffix = suffix
 
     def build_handshake(self, authcode: str, client_token: str, serial: str, session: str) -> bytes:
-        raw = f"{authcode}:{client_token}:{serial}:{session}".encode("utf-8") + self.suffix
-        return base64.b64encode(raw)
+        return _build_agent_handshake_wire(f"{authcode}:{client_token}:{serial}:{session}", self.suffix)
 
     def parse_handshake_response(self, decoded: bytes) -> dict[str, Any]:
-        if decoded.endswith(self.suffix):
+        if self.suffix and decoded.endswith(self.suffix):
             decoded = decoded[: -len(self.suffix)]
         text = decoded.decode("utf-8", errors="replace")
         try:
@@ -3161,6 +3190,11 @@ def run_probe(
                     }
                     return result
                 parsed = self.parse_handshake_response(decoded)
+                ack_error = _agent_handshake_error(parsed)
+                if ack_error:
+                    result["handshake"] = {**sent_info, "ok": False, "error": ack_error}
+                    result["error"] = ack_error
+                    return result
                 result["handshake"] = {
                     **sent_info,
                     "ok": True,
@@ -3688,6 +3722,12 @@ class LocalAgentTcpBindProxy:
                 self.handshake = {**self.handshake, "ok": False, "error": self.error}
                 return
             parsed = AgentTcpLiveProbe(self.suffix).parse_handshake_response(decoded)
+            ack_error = _agent_handshake_error(parsed)
+            if ack_error:
+                self.state = "error"
+                self.error = ack_error
+                self.handshake = {**self.handshake, "ok": False, "error": ack_error}
+                return
             self.handshake = {
                 **self.handshake,
                 "ok": True,
@@ -3913,8 +3953,7 @@ class LocalAgentSdkBindProxy:
         # actual app traffic and has correlated with "dead" 6611 sessions that
         # never return the base64 DestIP reply.
         raw_text = f"{self.authcode}:{self.agent_client_uuid}:{self.serial}:{self.agent_session_id}"
-        raw = raw_text.encode("utf-8") + self.suffix
-        return base64.b64encode(raw)
+        return _build_agent_handshake_wire(raw_text, self.suffix)
 
     def _run(self) -> None:
         try:
@@ -3981,6 +4020,12 @@ class LocalAgentSdkBindProxy:
                 self.handshake = {**self.handshake, "ok": False, "error": self.error}
                 return
             parsed = AgentTcpLiveProbe(self.suffix).parse_handshake_response(decoded)
+            ack_error = _agent_handshake_error(parsed)
+            if ack_error:
+                self.state = "error"
+                self.error = ack_error
+                self.handshake = {**self.handshake, "ok": False, "error": ack_error}
+                return
             self.handshake = {
                 **self.handshake,
                 "ok": True,
@@ -4205,11 +4250,10 @@ class AgentTcpEncryptedClaimProbe:
         self.suffix = suffix
 
     def build_handshake(self, authcode: str, client_token: str, serial: str, session: str) -> bytes:
-        raw = f"{authcode}:{client_token}:{serial}:{session}".encode("utf-8") + self.suffix
-        return base64.b64encode(raw)
+        return _build_agent_handshake_wire(f"{authcode}:{client_token}:{serial}:{session}", self.suffix)
 
     def parse_handshake_response(self, decoded: bytes) -> dict[str, Any]:
-        if decoded.endswith(self.suffix):
+        if self.suffix and decoded.endswith(self.suffix):
             decoded = decoded[: -len(self.suffix)]
         text = decoded.decode("utf-8", errors="replace")
         try:
@@ -4302,8 +4346,12 @@ class AgentTcpEncryptedClaimProbe:
                     entry[key] = value
             result["plain_handoff_timeline"].append(entry)
 
-        tx_cipher = _XorKeystream(xor_key)
-        rx_cipher = _XorKeystream(xor_key)
+        # AgentLib::agent_session::data_helper is a pass-through when its
+        # rands length is zero. Camera claim/login encryption is independent.
+        tx_cipher = _XorKeystream(xor_key) if xor_key else None
+        rx_cipher = _XorKeystream(xor_key) if xor_key else None
+        result['stream_encoding'] = 'xor' if xor_key else 'none'
+        result['sdk_no_randomstr'] = not bool(xor_key)
         _emit_progress(f"TCP connect request {host}:{port}")
         sock = _create_tcp_connection((host, port), timeout=timeout)
         _emit_progress(f"TCP connect response {host}:{port}")
@@ -4355,6 +4403,11 @@ class AgentTcpEncryptedClaimProbe:
                     }
                     return result
                 parsed = self.parse_handshake_response(decoded)
+                ack_error = _agent_handshake_error(parsed)
+                if ack_error:
+                    result["handshake"] = {**sent_info, "ok": False, "error": ack_error}
+                    result["error"] = ack_error
+                    return result
                 result["handshake"] = {
                     **sent_info,
                     "ok": True,
@@ -4390,11 +4443,11 @@ class AgentTcpEncryptedClaimProbe:
                 unk=unk,
                 cmd=cmd,
             )
-            encrypted_frame = tx_cipher.apply(frame)
+            encrypted_frame = tx_cipher.apply(frame) if tx_cipher else frame
             _emit_progress(f"TCP OPMonitor Claim request cmd=0x{cmd:04x}")
             sock.sendall(encrypted_frame)
 
-            buffer = rx_cipher.apply(leftover)
+            buffer = rx_cipher.apply(leftover) if rx_cipher else leftover
             received = bytearray(leftover)
             decoded_stream = bytearray(buffer)
             frames: list[TcpFrame] = []
@@ -4821,7 +4874,7 @@ class AgentTcpEncryptedClaimProbe:
                     "plain_payload_text": str(followup.get("plain_payload_text") or ""),
                     "sent_at": time.time(),
                 }
-                return tx_cipher.apply(followup_frame), sent_summary
+                return (tx_cipher.apply(followup_frame) if tx_cipher else followup_frame), sent_summary
 
             def _followup_wait_satisfied(followup: dict[str, Any]) -> bool:
                 wait_cmd = int(followup.get("wait_for_response_cmd") or 0)
@@ -5330,7 +5383,7 @@ class AgentTcpEncryptedClaimProbe:
                     pass
                 else:
                     received.extend(chunk)
-                    decoded_chunk = rx_cipher.apply(chunk)
+                    decoded_chunk = rx_cipher.apply(chunk) if rx_cipher else chunk
                     decoded_stream.extend(decoded_chunk)
                     buffer += decoded_chunk
                     parsed_frames, buffer = _parse_tcp_frames(buffer)
@@ -5462,7 +5515,7 @@ class AgentTcpEncryptedClaimProbe:
                     )
                     if claim_response_live is not None:
                         claim_response_summary_live = _summarize_tcp_frame(claim_response_live)
-                        claim_json = claim_response_summary_live.get("aes_decrypted_json")
+                        claim_json = _frame_json_payload(claim_response_summary_live)
                         if isinstance(claim_json, dict) and claim_json:
                             builder_kwargs = dict(login_followup_builder)
                             msg_id_value = (
@@ -6358,7 +6411,7 @@ class RpsLiveChain:
 
         if tcp_mode in {"encrypted", "both"}:
             random_str = str(agent_parsed.get("random_str") or "")
-            if random_str:
+            if random_str or str(agent_parsed.get('protocol_mode') or protocol_mode).lower() == 'tcp':
                 enc_probe = AgentTcpEncryptedClaimProbe()
                 control_bind_proxy: LocalAgentTcpBindProxy | LocalAgentSdkBindProxy | None = None
                 plain_claim_replay_count_default = 0
@@ -6525,7 +6578,8 @@ class RpsLiveChain:
                             continue
 
                     current_random_str = str(current_parsed.get("random_str") or "")
-                    if not current_random_str:
+                    if (not current_random_str
+                            and str(current_parsed.get('protocol_mode') or protocol_mode).lower() != 'tcp'):
                         continue
                     enc_host = str(current_parsed.get("agent_server_ip") or "")
                     enc_port = int(current_parsed.get("agent_server_port") or 0)
@@ -6658,7 +6712,7 @@ class RpsLiveChain:
             else:
                 result["tcp_encrypted_probe"] = {
                     "status": "error",
-                    "error": "random_str_missing",
+                    "error": "unsupported_agent_transport_without_randomstr",
                 }
                 probe_statuses.append("error")
 
@@ -7432,6 +7486,8 @@ class CloudAuthSession:
     raw_device_token: dict[str, Any] = field(default_factory=dict)
     raw_ams_device_list: dict[str, Any] = field(default_factory=dict)
     raw_acapp_auth_list: dict[str, Any] = field(default_factory=dict)
+    ams_base: str = ""
+    ams_login_base: str = ""
 
 
 @dataclass
@@ -10185,6 +10241,69 @@ class CloudLiveExtractor:
         self.boss_bases = boss_bases or list(DEFAULT_BOSS_BASES)
         self.openapi_bases = openapi_bases or list(DEFAULT_OPENAPI_BASES)
         self._last_login_kwargs: dict[str, Any] = {}
+        self.ams_cache: AmsCache | None = None
+        self.ams_base_override = ""
+        self.ams_preferred_base = ""
+
+    def _ams_candidates(self, session=None, ams_bases=None, serial_number="") -> list[str]:
+        if ams_bases:
+            return list(dict.fromkeys(normalize_ams_base(base) for base in ams_bases))
+        return ams_candidates(
+            DEFAULT_AMS_BASES, explicit=self.ams_base_override,
+            preferred=(self.ams_cache.preferred_region(serial_number) if serial_number and self.ams_cache
+                       else self.ams_preferred_base or (self.ams_cache.preferred_region() if self.ams_cache else "")),
+            previous=(session.ams_base or session.ams_login_base) if session else "",
+        )
+
+    def _remember_ams_region(self, session, base: str, serial_number: str = "") -> None:
+        session.ams_base = base
+        if self.ams_cache:
+            self.ams_cache.remember_region(base, serial_number)
+            self.ams_cache.save_session(session)
+
+    def _ams_json_request(self, session, *, base, endpoint, params, timeout, user_agent, time_millis, ssl_verify):
+        attempts: list[HttpResult] = []
+        for auth_attempt in range(2):
+            req_time = str(time_millis or _next_ams_time_millis()).strip()
+            signature = compute_signature(uuid=session.uuid, app_key=session.app_key, secret=session.secret,
+                                          time_millis=req_time, move_card=int(session.move_card))
+            aes_key = _derive_ams_response_key(req_time, session.secret)
+            plain_body = urllib.parse.urlencode(params) if params is not None else ""
+            body = _encrypt_ams_hex_payload(plain_body, aes_key) if params is not None else b""
+            result = http_text(
+                url=f"{base.rstrip('/')}/{endpoint}/v3/{req_time}/{signature}.rs",
+                method="POST", payload=body, timeout=timeout, ssl_verify=ssl_verify,
+                headers={"Accept": "text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2",
+                         "Accept-Charset": "utf-8", "Accept-Encoding": "gzip, deflate",
+                         "Authorization": session.user_token, "Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": user_agent, "appKey": session.app_key, "uuid": session.uuid},
+            )
+            attempts.append(result)
+            result.request_payload = {"time_millis": req_time, "signature": signature, "user_agent": user_agent,
+                                      "uuid": session.uuid, "app_key": session.app_key, "ams_base": base}
+            if params is not None:
+                result.request_payload.update(serial_number=params.get('uuid'), auth_type=params.get('type'),
+                                              plain_body=plain_body, encrypted_body=body)
+            if result.ok and result.text:
+                try:
+                    result.text = _decrypt_ams_hex_payload(result.text, aes_key)
+                    result.json_data = json.loads(result.text)
+                except Exception as exc:  # noqa: BLE001
+                    result.error = f"{endpoint}_decrypt:{type(exc).__name__}"
+            rejected_token = result.status == 401 or _is_token_error(result)
+            if auth_attempt == 0 and rejected_token and self._last_login_kwargs.get('mode') == 'ams_password':
+                # Tokens may be region-specific. Refresh only on an explicit
+                # auth rejection, never for an empty list or a non-hex body.
+                kwargs = dict(self._last_login_kwargs)
+                kwargs.pop('mode', None)
+                kwargs.update(timeout=timeout, ams_bases=[base])
+                try:
+                    session, _ = self.login_with_ams_credentials(**kwargs)
+                    continue
+                except RuntimeError:
+                    pass
+            break
+        return session, attempts
 
     def _apply_hints_to_session(self, session: CloudAuthSession, hints: _AuthHints) -> None:
         if hints.app_keys and not session.app_key:
@@ -10402,7 +10521,7 @@ class CloudLiveExtractor:
             "ssl_verify": ssl_verify,
         }
         attempts: list[HttpResult] = []
-        bases = _dedupe([*(ams_bases or []), *DEFAULT_AMS_BASES])
+        bases = self._ams_candidates(ams_bases=ams_bases)
         for base in bases:
             req_time = _next_ams_time_millis()
             signature = compute_signature(
@@ -10475,6 +10594,9 @@ class CloudLiveExtractor:
             session.secret = session.secret or resolved_secret
             session.move_card = session.move_card or resolved_move_card
             session.vendor = session.vendor or resolved_vendor
+            session.ams_login_base = base
+            if self.ams_cache:
+                self.ams_cache.save_session(session, fresh=True)
             return session, attempts
         raise RuntimeError(f"AMS loginExist failed; attempts={_summarize_http_results(attempts, limit=8)}")
 
@@ -10730,71 +10852,29 @@ class CloudLiveExtractor:
         user_agent: str = DEFAULT_AMS_USER_AGENT,
         time_millis: str = "",
         ssl_verify: bool = True,
+        serial_number: str = "",
     ) -> tuple[CloudAuthSession, list[dict[str, Any]], list[HttpResult]]:
         attempts: list[HttpResult] = []
         if not session.user_token:
             raise RuntimeError("user_token is required for AMS device list")
         if not session.app_key or not session.uuid or not session.secret or not session.move_card:
             raise RuntimeError("app_key/uuid/secret/move_card are required for AMS device list")
-
-        bases = _dedupe([*(ams_bases or []), *DEFAULT_AMS_BASES])
-        for base in bases:
-            req_time = str(time_millis or _next_ams_time_millis()).strip()
-            signature = compute_signature(
-                uuid=session.uuid,
-                app_key=session.app_key,
-                secret=session.secret,
-                time_millis=req_time,
-                move_card=int(session.move_card),
+        session.raw_ams_device_list = {}
+        for base in self._ams_candidates(session, ams_bases, serial_number):
+            session, requests = self._ams_json_request(
+                session, base=base, endpoint="msdlistCode", params=None, timeout=timeout,
+                user_agent=user_agent, time_millis=time_millis, ssl_verify=ssl_verify,
             )
-            url = f"{base.rstrip('/')}/msdlistCode/v3/{req_time}/{signature}.rs"
-            headers = {
-                "Accept": "text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2",
-                "Accept-Charset": "utf-8",
-                "Accept-Encoding": "gzip, deflate",
-                "Authorization": session.user_token,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": user_agent,
-                "appKey": session.app_key,
-                "uuid": session.uuid,
-            }
-            result = http_text(
-                url=url,
-                method="POST",
-                payload=b"",
-                headers=headers,
-                timeout=timeout,
-                ssl_verify=ssl_verify,
-            )
-            result.request_payload = {
-                "time_millis": req_time,
-                "signature": signature,
-                "user_agent": user_agent,
-                "uuid": session.uuid,
-                "app_key": session.app_key,
-            }
-            attempts.append(result)
-            if not result.ok or not result.text:
+            attempts.extend(requests)
+            result = requests[-1]
+            if not result.ok or result.error or not isinstance(result.json_data, dict):
                 continue
-            try:
-                aes_key = _derive_ams_response_key(req_time, session.secret)
-                plain_text = _decrypt_ams_hex_payload(result.text, aes_key)
-                plain_json = json.loads(plain_text)
-            except Exception as exc:  # noqa: BLE001
-                result.error = f"ams_decrypt:{exc}"
+            devices = _extract_ams_devices(result.json_data)
+            if not devices or (serial_number and not any(row.get('_device_id') == serial_number for row in devices)):
                 continue
-            result.json_data = plain_json
-            result.text = plain_text
-            devices = _extract_ams_devices(plain_json)
-            if devices:
-                session.raw_ams_device_list = {
-                    "base": base,
-                    "time_millis": req_time,
-                    "signature": signature,
-                    "devices": devices,
-                    "raw": plain_json,
-                }
-                return session, devices, attempts
+            session.raw_ams_device_list = {"base": base, "devices": devices, "raw": result.json_data}
+            self._remember_ams_region(session, base, serial_number)
+            return session, devices, attempts
         return session, [], attempts
 
     def fetch_acapp_auth_list(
@@ -10816,72 +10896,25 @@ class CloudLiveExtractor:
             raise RuntimeError("user_token is required for acapp auth list")
         if not session.app_key or not session.uuid or not session.secret or not session.move_card:
             raise RuntimeError("app_key/uuid/secret/move_card are required for acapp auth list")
-
-        bases = _dedupe([*(ams_bases or []), *DEFAULT_AMS_BASES])
-        for base in bases:
-            req_time = str(time_millis or _next_ams_time_millis()).strip()
-            signature = compute_signature(
-                uuid=session.uuid,
-                app_key=session.app_key,
-                secret=session.secret,
-                time_millis=req_time,
-                move_card=int(session.move_card),
+        session.raw_acapp_auth_list = {}
+        for base in self._ams_candidates(session, ams_bases, serial_number):
+            session, requests = self._ams_json_request(
+                session, base=base, endpoint="acapp", params={"uuid": serial_number, "type": auth_type},
+                timeout=timeout, user_agent=user_agent, time_millis=time_millis, ssl_verify=ssl_verify,
             )
-            aes_key = _derive_ams_response_key(req_time, session.secret)
-            plain_body = urllib.parse.urlencode({"uuid": serial_number, "type": auth_type})
-            encrypted_body = _encrypt_ams_hex_payload(plain_body, aes_key)
-            url = f"{base.rstrip('/')}/acapp/v3/{req_time}/{signature}.rs"
-            headers = {
-                "Accept": "text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2",
-                "Accept-Charset": "utf-8",
-                "Accept-Encoding": "gzip, deflate",
-                "Authorization": session.user_token,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": user_agent,
-                "appKey": session.app_key,
-                "uuid": session.uuid,
-            }
-            result = http_text(
-                url=url,
-                method="POST",
-                payload=encrypted_body,
-                headers=headers,
-                timeout=timeout,
-                ssl_verify=ssl_verify,
-            )
-            result.request_payload = {
-                "time_millis": req_time,
-                "signature": signature,
-                "user_agent": user_agent,
-                "uuid": session.uuid,
-                "app_key": session.app_key,
-                "serial_number": serial_number,
-                "auth_type": auth_type,
-                "plain_body": plain_body,
-                "encrypted_body": encrypted_body,
-            }
-            attempts.append(result)
-            if not result.ok or not result.text:
+            attempts.extend(requests)
+            result = requests[-1]
+            if not result.ok or result.error or not isinstance(result.json_data, dict):
                 continue
-            try:
-                plain_text = _decrypt_ams_hex_payload(result.text, aes_key)
-                plain_json = json.loads(plain_text)
-            except Exception as exc:  # noqa: BLE001
-                result.error = f"acapp_decrypt:{exc}"
+            rows = _extract_acapp_auth_rows(result.json_data)
+            matching = [row for row in rows if row.get('_device_id') == serial_number
+                        and (row.get(auth_type) or (row.get('_auth_name', '').lower() in {'', auth_type.lower()}
+                                                   and row.get('_auth_code')))]
+            if not matching:
                 continue
-            result.json_data = plain_json
-            result.text = plain_text
-            rows = _extract_acapp_auth_rows(plain_json)
-            if rows:
-                session.raw_acapp_auth_list = {
-                    "base": base,
-                    "time_millis": req_time,
-                    "signature": signature,
-                    "auth_type": auth_type,
-                    "rows": rows,
-                    "raw": plain_json,
-                }
-                return session, rows, attempts
+            session.raw_acapp_auth_list = {"base": base, "auth_type": auth_type, "rows": rows, "raw": result.json_data}
+            self._remember_ams_region(session, base, serial_number)
+            return session, rows, attempts
         return session, [], attempts
 
     def _build_openapi_creds(

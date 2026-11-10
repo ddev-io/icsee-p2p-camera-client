@@ -13,6 +13,7 @@ desktop_monitor.local.json
 
 login.txt
 xmplayer/config/token_cache.json
+xmplayer/config/ams_cache.json*
 xmplayer/config/relay_cache.json
 xmplayer/config/agent_client_uuid.txt
 xmplayer/logs/agent_client_uuid.txt
@@ -29,6 +30,7 @@ recordings/
 desktop_monitor.user.json
 
 native/build/
+/analysis/
 
 .DS_Store
 Thumbs.db

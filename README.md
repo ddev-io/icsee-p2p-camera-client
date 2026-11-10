@@ -19,7 +19,8 @@ You need these installed in the Python/runtime environment used to start the GUI
 - `tkinter`
 - `Pillow`
 - `pycryptodome`
-- `ffmpeg` must be available on `PATH`, or set `ffmpeg_path` in `desktop_monitor.json` to its executable
+
+`ffmpeg` is required for live video and recording playback. The app can start and use camera Wi-Fi settings, recording lists and messages without it. Playback shows an error if FFmpeg is missing. Install it on `PATH`, or set `ffmpeg_path` in the configuration to its executable.
 
 ## Setup
 
@@ -47,6 +48,7 @@ python run_gui.py
 - The Wi-Fi commands follow the [FunSDK network settings example](https://github.com/jlinklab/jlink-funsdk-android-demo/blob/main/app/src/main/java/demo/xm/com/xmfunsdkdemo/ui/device/config/networksetting/presenter/NetworkSettingPresenter.java). Actual network switching must be verified on the target camera; local tests do not establish that it successfully joined the new network.
 
 - `SD` maps to `Extra1`
+- The port-6611 relay handshake uses `Base64(auth:client:serial:session)` followed by literal `XXEE`. TCP relay replies without `RandomStr` use the SDK's transport without outer XOR while retaining the authenticated camera claim/login and post-login commands. Reports show `encoding=none` for this mode and `encoding=xor` when a relay key is present. Static SDK analysis and offline relay tests support this behavior; successful video still needs verification on the affected camera.
 - `HD` maps to `Main`
 - audio uses G.711 A-law frames from the camera stream
 - the default config is tuned to wait longer for second-handshake media frames than the original short probe setup
@@ -59,6 +61,9 @@ python run_gui.py
 - On the first run, enter the iCSee/XM app credentials when prompted.
 - `login.txt` and `desktop_monitor.local.json` stay on the local computer and are ignored by Git.
 - Leave `agent_client_id` empty in `desktop_monitor.json` so each PC creates its own relay client id.
+- AMS camera discovery automatically checks the EU, South America, North America and Asia servers. An empty camera list, or a list without the selected camera, continues the search. The working region is remembered for the account and camera and used first on later requests.
+- To pin a region, add `"ams_base": "sa"` (or `eu`, `na`, `as`) to `desktop_monitor.local.json`. An official HTTPS AMS server URL is also accepted. The optional `XMPLAYER_AMS_BASE` environment variable applies when the config leaves `ams_base` empty. A pinned region disables fallback to other AMS servers.
+- AMS sessions are reused for up to 15 minutes, bounded by token expiry. Session/region data is kept in the ignored, local `xmplayer/config/ams_cache.json`; it contains authentication tokens, not the login password or raw login responses. It is bound to the machine, account, credentials and region override. Camera token caches are also invalidated when those settings change. Repeated diagnostics reuse valid tokens instead of forcing another login.
 - Caches in `xmplayer/config/` are machine-bound. If copied to another PC, `token_cache.json`, `relay_cache.json`, and `agent_client_uuid.txt` are ignored and recreated automatically.
 - To force the legacy fixed `agent_client_id` from config for a one-off test, set `XMPLAYER_USE_CONFIG_AGENT_CLIENT_ID=1` before starting the app.
 - If live video, recordings, or message images do not load on another PC, run `diagnose_xmplayer.cmd`. It writes a short report to `diagnostics.txt`.

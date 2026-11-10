@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from ..core.ams_regions import normalize_ams_base
 
 
 @dataclass(slots=True)
@@ -38,6 +39,7 @@ class MonitorConfig:
     display_mode: str
     window: WindowConfig
     paths: PathsConfig
+    ams_base: str = ''
 
 
 def _resolve_path(project_root: Path, value: str) -> Path:
@@ -103,6 +105,7 @@ def load_monitor_config(config_path: str | Path | None = None) -> MonitorConfig:
         display_mode=str(raw.get('display_mode') or 'stacked_split').strip().lower() or 'stacked_split',
         window=window,
         paths=paths,
+        ams_base=normalize_ams_base(raw.get('ams_base') or ''),
     )
     if cfg.default_quality not in {'sd', 'hd'}:
         raise ValueError('default_quality must be sd or hd')

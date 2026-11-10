@@ -82,9 +82,6 @@ def _startup_issues(config: MonitorConfig) -> list[str]:
         importlib.import_module('PIL.ImageTk')
     except Exception as exc:
         issues.append(f'Pillow ImageTk bridge is unavailable: {exc}')
-    ffmpeg_ok = bool(Path(config.ffmpeg_path).exists()) if Path(config.ffmpeg_path).is_absolute() else bool(shutil.which(config.ffmpeg_path))
-    if not ffmpeg_ok:
-        issues.append(f'ffmpeg not found: {config.ffmpeg_path}')
     if not config.cloud_login_file.exists():
         issues.append(f'cloud login file not found: {config.cloud_login_file}')
     else:
@@ -1620,6 +1617,18 @@ def main() -> int:
 
         def _start_session(self, *, reconnect: bool, recording: RecordingItem | None = None) -> None:
             if self._closing:
+                return
+            if not shutil.which(self.config_data.ffmpeg_path):
+                from tkinter import messagebox
+
+                message = (
+                    'FFmpeg is required to play live video and recordings.\n\n'
+                    f'FFmpeg not found: {self.config_data.ffmpeg_path}\n\n'
+                    'Install FFmpeg or set ffmpeg_path to its executable in the configuration.'
+                )
+                self._set_state('Error', 'FFmpeg not found. Video playback is unavailable.')
+                self._update_controls()
+                messagebox.showerror('Video playback unavailable', message, parent=self)
                 return
             if reconnect and self._worker_alive():
                 self._cancel_restart_timer()

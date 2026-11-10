@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from ..config.loader import MonitorConfig, validate_cloud_login_file
 from . import legacy_api, legacy_cli
+from .ams_regions import credential_identity
 
 StatusCallback = Callable[[str, str], None]
 
@@ -471,6 +472,19 @@ def _token_cache_path(config: MonitorConfig) -> Path:
     return path
 
 
+def _cloud_cache_identity(config: MonitorConfig) -> str:
+    try:
+        login, password, _ = legacy_cli._resolve_cloud_login_password(
+            explicit_login='', explicit_password='', login_file=str(config.cloud_login_file),
+        )
+        if not login or not password:
+            return ''
+        return credential_identity(login, password, legacy_cli.DEFAULT_ICSEE_APP_KEY,
+                                   getattr(config, 'ams_base', '') or os.environ.get('XMPLAYER_AMS_BASE', ''))
+    except (OSError, ValueError, RuntimeError):
+        return ''
+
+
 def _load_token_cache(config: MonitorConfig, *, serial_number: str, runtime_mode: str) -> tuple[str, str, dict[str, Any], dict[str, Any]] | None:
     path = _token_cache_path(config)
     if not path.exists():
@@ -480,6 +494,9 @@ def _load_token_cache(config: MonitorConfig, *, serial_number: str, runtime_mode
     except Exception:
         return None
     if not isinstance(cache, dict):
+        return None
+    identity = _cloud_cache_identity(config)
+    if not identity or cache.get('account_identity') != identity:
         return None
     if str(cache.get('device_id') or '').strip() != serial_number:
         return None
@@ -501,6 +518,7 @@ def _load_token_cache(config: MonitorConfig, *, serial_number: str, runtime_mode
         'source': 'token_cache',
         'cache_age_seconds': round(age_seconds, 1),
         'cache_path': str(path),
+        'ams_base': str(cache.get('ams_base') or ''),
     }
     auth_info = dict(common)
     auth_info['mode'] = 'cached_authcode'
@@ -516,12 +534,15 @@ def _save_token_cache(
     runtime_mode: str,
     authcode: str,
     admin_token: str,
+    ams_base: str = '',
 ) -> None:
     if not authcode or not admin_token:
         return
     path = _token_cache_path(config)
     payload = {
-        'version': 1,
+        'version': 2,
+        'account_identity': _cloud_cache_identity(config),
+        'ams_base': ams_base,
         'machine_id': _cache_machine_id(),
         'device_id': serial_number,
         'runtime_mode': runtime_mode,
@@ -566,6 +587,7 @@ def _load_or_refresh_rps_tokens(
         explicit_app_key=legacy_cli.DEFAULT_ICSEE_APP_KEY,
         refresh_mode=runtime_mode,
         ssl_verify=False,
+        explicit_ams_base=getattr(config, 'ams_base', ''),
     )
     if not authcode:
         raise MonitorCaptureError('failed to refresh authcode')
@@ -582,6 +604,7 @@ def _load_or_refresh_rps_tokens(
         login_file=str(config.cloud_login_file),
         explicit_app_key=legacy_cli.DEFAULT_ICSEE_APP_KEY,
         ssl_verify=False,
+        explicit_ams_base=getattr(config, 'ams_base', ''),
     )
     if not admin_token:
         raise MonitorCaptureError('failed to refresh AdminToken')
@@ -593,6 +616,7 @@ def _load_or_refresh_rps_tokens(
             runtime_mode=runtime_mode,
             authcode=authcode,
             admin_token=admin_token,
+            ams_base=str(authcode_refresh.get('ams_base') or ''),
         )
     except Exception:
         pass
@@ -630,7 +654,9 @@ def _detect_failure_stage(result: dict[str, Any]) -> dict[str, Any]:
     enc_probe = result.get('tcp_encrypted_probe') if isinstance(result.get('tcp_encrypted_probe'), dict) else {}
     if enc_probe.get('status') != 'ok':
         frames = enc_probe.get('frames') if isinstance(enc_probe.get('frames'), dict) else {}
-        detail = _short_error(enc_probe.get('error') or frames.get('exit_reason') or 'first encrypted 6611 did not complete')
+        handshake = enc_probe.get('handshake') if isinstance(enc_probe.get('handshake'), dict) else {}
+        detail = _short_error(enc_probe.get('error') or handshake.get('error') or frames.get('exit_reason')
+                              or 'first 6611 control connection did not complete')
         return {
             'stage': 'first_6611',
             'detail': detail,
@@ -703,6 +729,7 @@ def summarize_live_probe_failure(result: dict[str, Any]) -> dict[str, Any]:
         'agent_protocol': _summarize_agent_protocol(result),
         'agent_server': _summarize_agent_server(result),
         'encrypted_probe': {
+            'stream_encoding': enc_probe.get('stream_encoding'),
             'endpoint': (
                 f"{enc_probe.get('agent_host')}:{enc_probe.get('agent_port')}"
                 if enc_probe.get('agent_host') and enc_probe.get('agent_port')
@@ -975,6 +1002,7 @@ def _extract_alarm_auth_context(
         session=session,
         timeout=timeout,
         ssl_verify=False,
+        serial_number=device_id,
     )
     matched = next((row for row in devices if str(row.get('_device_id') or '') == device_id), {})
     pms_auth = str(matched.get('pms') or '').strip()
@@ -1140,6 +1168,7 @@ def discover_cloud_device_ids(config: MonitorConfig, *, timeout: int = 20) -> li
         login_file=str(config.cloud_login_file),
         explicit_app_key=legacy_cli.DEFAULT_ICSEE_APP_KEY,
         ssl_verify=False,
+        explicit_ams_base=getattr(config, 'ams_base', ''),
     )
     _session, devices, _attempts = extractor.fetch_ams_device_list(
         session=session,
@@ -1171,6 +1200,8 @@ def fetch_monitor_messages(config: MonitorConfig, *, limit: int = 30, timeout: i
         login_file=str(config.cloud_login_file),
         explicit_app_key=legacy_cli.DEFAULT_ICSEE_APP_KEY,
         ssl_verify=False,
+        explicit_ams_base=getattr(config, 'ams_base', ''),
+        target_serial=config.device_id,
     )
     device_id = config.device_id.strip()
     auth, muserid, account_id, auth_meta = _extract_alarm_auth_context(

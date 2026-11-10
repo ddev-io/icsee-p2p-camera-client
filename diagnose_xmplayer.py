@@ -181,6 +181,7 @@ def _emit_live_probe_details(rows: list[str], root: Path, result: dict) -> dict:
         root,
         'INFO first6611: '
         f"endpoint={enc.get('endpoint') or '-'} status={enc.get('status') or '-'} "
+        f"encoding={enc.get('stream_encoding') or '-'} "
         f"handshake={enc.get('handshake_ok')} h_err={enc.get('handshake_error') or '-'} "
         f"err={enc.get('error') or '-'} {frame_text}",
     )
@@ -373,7 +374,7 @@ def main() -> int:
     if not login_issue:
         raw_text = cfg.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore')
         try:
-            _emit(rows, root, 'RUN  cloud token refresh...')
+            _emit(rows, root, 'RUN  cloud token load/refresh...')
             authcode, auth_info, _admin_token, admin_info = _load_or_refresh_rps_tokens(
                 cfg,
                 raw_text=raw_text,
@@ -381,9 +382,10 @@ def main() -> int:
                 refresh_timeout=12,
                 runtime_mode=cfg.runtime_mode,
                 status_callback=None,
-                force_refresh=True,
             )
-            _emit(rows, root, _ok('cloud token refresh', f"auth={auth_info.get('mode', '')} admin={admin_info.get('mode', '')}"))
+            _emit(rows, root, _ok('cloud token load/refresh',
+                  f"auth={auth_info.get('mode', '')} admin={admin_info.get('mode', '')} "
+                  f"ams={auth_info.get('ams_base') or admin_info.get('ams_base') or 'auto'}"))
             _emit(rows, root, 'RUN  pub-status query...')
             status = legacy_api.status_protocol_query(
                 serial_number=cfg.device_id,
