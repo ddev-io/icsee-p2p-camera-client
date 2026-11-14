@@ -3262,7 +3262,8 @@ def run_probe(
             sock.sendall(frame)
 
             buffer = leftover
-            received = bytearray(leftover)
+            received = bytearray(leftover[:128])
+            received_total_bytes = len(leftover)
             frames: list[TcpFrame] = []
             data_frame_count = 0
             data_total_bytes = 0
@@ -3391,7 +3392,11 @@ def run_probe(
                     break
                 else:
                     last_chunk_at = time.time()
-                    received.extend(chunk)
+                    received_total_bytes += len(chunk)
+                    # Only the diagnostic prefix is used below. Keep long
+                    # recording downloads on disk rather than retaining a copy.
+                    if len(received) < 128:
+                        received.extend(chunk[:128 - len(received)])
                     if extend_on_activity:
                         end_time = time.time() + max(0.5, capture_seconds)
                     buffer += chunk
@@ -3535,7 +3540,7 @@ def run_probe(
                 "last_chunk_at_seconds": round(last_chunk_at - probe_started_at, 3) if last_chunk_at else None,
                 "first_frames": first_frame_summaries,
                 "data_frames": data_frame_summaries,
-                "raw_total_bytes": len(received),
+                "raw_total_bytes": received_total_bytes,
                 "raw_head_hex": bytes(received[:128]).hex(),
                 "raw_tail_hex": bytes(buffer[:128]).hex(),
             }

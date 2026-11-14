@@ -1959,8 +1959,8 @@ def run_recording_playback_stream(
     attempt_count = attempts if attempts is not None else max(1, min(config.attempts, 2))
     duration = max(int(recording.duration_seconds or 0), 0)
     stream_seconds = float(capture_seconds) if capture_seconds is not None else max(float(config.capture_seconds), float(duration + 8 if duration else 45))
-    stream_seconds = max(12.0, min(stream_seconds, 600.0))
-    max_frames = max(int(config.max_frames), 65536)
+    stream_seconds = max(12.0, min(stream_seconds, 600.0) if capture_seconds is None else stream_seconds)
+    max_frames = max(int(config.max_frames), 65536, int(stream_seconds * 300) if capture_seconds is not None else 0)
     progress = _StartupProgress(status_callback, total_steps=34)
 
     authcode, authcode_refresh, admin_token, admin_token_refresh = _load_or_refresh_rps_tokens(

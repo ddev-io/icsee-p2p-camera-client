@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from . import xstream_decoder as xd
 
 
@@ -14,11 +16,44 @@ def _fc_annexb_blob(payload_bytes: bytes) -> bytes:
 
 
 class LiveXStreamHevcAssembler:
-    def __init__(self, random_str: str = "") -> None:
+    def __init__(self, random_str: str = "", *, track_timestamps: bool = False) -> None:
         self._buffer = bytearray()
         self._random_str = ""
         self._key = None
+        self._track_timestamps = track_timestamps
+        self.frame_rate: int | None = None
+        self.video_codec = 'hevc'
+        self.first_video_time: datetime | None = None
+        self.video_time: datetime | None = None
+        self._gop_time: datetime | None = None
+        self._gop_frame = 0
         self.set_random_str(random_str)
+
+    def _track_video_frame(self, frame: bytes, frame_type: int) -> None:
+        # DVRIP FC layout: codec, fps, width/8, height/8, packed date, length.
+        # Reference: github.com/OpenIPC/python-dvr/blob/master/dvrip.py,
+        # reassemble_bin_payload().
+        if frame_type == 0xFC:
+            self._gop_time = None
+            self._gop_frame = 0
+            if len(frame) < 16 or frame[4] not in {2, 3} or not 1 <= frame[5] <= 120:
+                return
+            self.video_codec = 'h264' if frame[4] == 2 else 'hevc'
+            self.frame_rate = frame[5]
+            packed = int.from_bytes(frame[8:12], 'little')
+            try:
+                self._gop_time = datetime(
+                    2000 + (packed >> 26), (packed >> 22) & 15, (packed >> 17) & 31,
+                    (packed >> 12) & 31, (packed >> 6) & 63, packed & 63,
+                )
+            except ValueError:
+                return
+        else:
+            self._gop_frame += 1
+        if self._gop_time is not None and self.frame_rate:
+            self.video_time = self._gop_time + timedelta(seconds=self._gop_frame / self.frame_rate)
+            if self.first_video_time is None:
+                self.first_video_time = self.video_time
 
     def set_random_str(self, random_str: str) -> None:
         normalized = str(random_str or "").strip()
@@ -36,6 +71,7 @@ class LiveXStreamHevcAssembler:
         video_out = bytearray()
         audio_out = bytearray()
         for frame, frame_type, head, plen, _total in frames:
+            video_size = len(video_out)
             raw_frame = frame
             raw_payload_bytes = raw_frame[head:head + plen]
             if self._key is not None and frame_type in DECRYPT_TYPES:
@@ -55,6 +91,8 @@ class LiveXStreamHevcAssembler:
                     video_out.extend(payload_bytes)
             elif frame_type == 0xFA:
                 audio_out.extend(payload_bytes)
+            if self._track_timestamps and len(video_out) > video_size:
+                self._track_video_frame(frame, frame_type)
         return bytes(video_out), bytes(audio_out)
 
     def push_payload(self, payload: bytes) -> bytes:

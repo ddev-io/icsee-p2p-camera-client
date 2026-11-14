@@ -17,6 +17,7 @@ import urllib.request
 
 from ..config.loader import MonitorConfig, load_monitor_config, validate_connection_credentials
 from ..core.service import (
+    _recording_key,
     CaptureArtifacts,
     MonitorCancelled,
     MonitorCaptureError,
@@ -33,6 +34,7 @@ from ..core.ptz import PtzCommandQueue
 from ..media.ffmpeg_player import FFmpegStreamDecoder
 from ..media.audio_player import G711AudioPlayer
 from ..media.live_hevc import LiveXStreamHevcAssembler
+from ..media.saving import SaveError, file_stem, save_message_image, save_recording
 
 
 def _load_palette(config: MonitorConfig) -> dict[str, str]:
@@ -197,7 +199,8 @@ def _run_gui_session() -> int:
         return 1
 
     import tkinter as tk
-    from PIL import Image, ImageTk
+    from tkinter import filedialog, messagebox, ttk
+    from PIL import Image, ImageDraw, ImageTk
     from .wifi import CameraWifiDialog
 
     palette = _load_palette(config)
@@ -209,6 +212,12 @@ def _run_gui_session() -> int:
             self.palette = palette
             self.Image = Image
             self.ImageTk = ImageTk
+            save_icon = Image.new('RGBA', (24, 24))
+            save_icon_draw = ImageDraw.Draw(save_icon)
+            save_icon_draw.line((12, 3, 12, 15), fill=self.palette['text'], width=2)
+            save_icon_draw.line((7, 10, 12, 15, 17, 10), fill=self.palette['text'], width=2)
+            save_icon_draw.line((4, 17, 4, 21, 20, 21, 20, 17), fill=self.palette['text'], width=2)
+            self._message_save_icon = ImageTk.PhotoImage(save_icon)
             self.title(f"xmplayer - {config.device_name}")
             self.geometry(f"{config.window.width}x{config.window.height}")
             self.configure(bg=self.palette['bg'])
@@ -222,6 +231,14 @@ def _run_gui_session() -> int:
             self._worker: threading.Thread | None = None
             self._recordings_worker: threading.Thread | None = None
             self._messages_worker: threading.Thread | None = None
+            self._download_worker: threading.Thread | None = None
+            self._download_stop_event = threading.Event()
+            self._recording_action_buttons: list[Any] = []
+            self._recording_download_views: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+            self._download_recording_key: tuple[str, str, str, int] | None = None
+            self._save_directory = Path.home() / 'Downloads'
+            if not self._save_directory.is_dir():
+                self._save_directory = Path.home()
             self._stop_event = threading.Event()
             self._decoder: FFmpegStreamDecoder | None = None
             self._audio_player: G711AudioPlayer | None = None
@@ -266,6 +283,10 @@ def _run_gui_session() -> int:
             self._message_thumb_hosts: dict[int, Any] = {}
             self._message_thumb_refs: dict[int, list[Any]] = {}
             self._message_full_images: dict[tuple[int, int], Any] = {}
+            self._message_image_data: dict[tuple[int, int], tuple[bytes, str]] = {}
+            self._message_timestamps: dict[int, str] = {}
+            self._message_save_notice_var = tk.StringVar(value='')
+            self._message_viewer_save_notice: Any | None = None
             self._message_viewer: Any | None = None
             self._message_viewer_key: tuple[int, int] | None = None
             self._message_viewer_photo: Any | None = None
@@ -523,9 +544,12 @@ def _run_gui_session() -> int:
         def _connection_busy(self) -> bool:
             return self._worker_alive() or any(
                 worker is not None and worker.is_alive()
-                for worker in (self._recordings_worker, self._messages_worker))
+                for worker in (self._recordings_worker, self._messages_worker, self._download_worker))
 
         def _open_wifi_settings(self) -> None:
+            if self._download_worker_alive():
+                messagebox.showinfo('Recording download', 'Wait for the recording to finish saving, or cancel it first.', parent=self)
+                return
             if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
                 self._wifi_dialog.lift()
                 self._wifi_dialog.focus_set()
@@ -664,6 +688,9 @@ def _run_gui_session() -> int:
         def _recordings_worker_alive(self) -> bool:
             return self._recordings_worker is not None and self._recordings_worker.is_alive()
 
+        def _download_worker_alive(self) -> bool:
+            return self._download_worker is not None and self._download_worker.is_alive()
+
         def _on_recordings_mousewheel(self, event) -> None:
             delta = int(-1 * (event.delta / 120)) if getattr(event, 'delta', 0) else 0
             if delta == 0:
@@ -671,7 +698,7 @@ def _run_gui_session() -> int:
             self.recordings_canvas.yview_scroll(delta, 'units')
 
         def _refresh_recordings(self) -> None:
-            if self._closing or self._recordings_worker_alive():
+            if self._closing or self._recordings_worker_alive() or self._download_worker_alive():
                 return
             self._recordings_loaded = True
             self.recordings_count_var.set('Recordings: ...')
@@ -698,6 +725,94 @@ def _run_gui_session() -> int:
                 return f'{hours:d}:{minutes:02d}:{sec:02d}'
             return f'{minutes:d}:{sec:02d}'
 
+        def _save_recording(self, recording: RecordingItem) -> None:
+            if self._closing or self._download_worker_alive():
+                return
+            download_key = _recording_key(recording)
+            if download_key not in self._recording_download_views:
+                return
+            self._download_recording_key = download_key
+            if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
+                self._set_recording_save_progress(0, 'Close Camera Wi-Fi before saving a recording.',
+                                                   color=self.palette['warn'], active=False)
+                return
+            if not shutil.which(self.config_data.ffmpeg_path):
+                self._set_recording_save_progress(0, 'FFmpeg is required to save recordings as MP4. Check ffmpeg_path.',
+                                                   color=self.palette['danger'], active=False)
+                return
+            selected = filedialog.asksaveasfilename(
+                parent=self, title='Save recording', initialdir=str(self._save_directory),
+                initialfile=f'recording_{file_stem(recording.start_time)}.mp4',
+                defaultextension='.mp4', filetypes=[('MP4 video', '*.mp4')])
+            if not selected:
+                return
+            destination = Path(selected)
+            self._save_directory = destination.parent
+            previous_worker = self._worker
+            self._on_stop()
+            self._download_stop_event = threading.Event()
+            cancel = self._download_stop_event
+            self._set_recording_save_progress(None, 'Preparing to save recording...')
+
+            def progress(value: float | None, text: str) -> None:
+                if not self._closing:
+                    if text.startswith('progress|'):
+                        text = self._parse_startup_progress(text)[1]
+                    self._ui_queue.put(('download_progress', (value, text), download_key))
+
+            def worker() -> None:
+                try:
+                    deadline = time.monotonic() + 30
+                    while previous_worker is not None and previous_worker.is_alive():
+                        if cancel.wait(0.1):
+                            raise MonitorCancelled('Saving cancelled')
+                        if time.monotonic() >= deadline:
+                            raise SaveError('Playback is still stopping. Wait and try saving again.')
+                    if cancel.is_set():
+                        raise MonitorCancelled('Saving cancelled')
+                    result = save_recording(self.config_data, recording, destination,
+                                            stop_event=cancel, progress=progress)
+                    self._ui_queue.put(('download_done', result, download_key))
+                except MonitorCancelled:
+                    self._ui_queue.put(('download_cancelled', None, download_key))
+                except Exception as exc:
+                    self._ui_queue.put(('download_error', str(exc), download_key))
+
+            # Let cancellation finish and remove temporary files even if the
+            # window is closed while a network request is returning.
+            self._download_worker = threading.Thread(target=worker, name='xmplayer-recording-save')
+            self._download_worker.start()
+            self._update_controls()
+
+        def _cancel_recording_save(self) -> None:
+            self._download_stop_event.set()
+            self._set_recording_save_progress(None, 'Cancelling...')
+
+        def _set_recording_save_progress(self, value: float | None, text: str, *,
+                                         key: tuple[str, str, str, int] | None = None,
+                                         color: str | None = None, active: bool = True) -> None:
+            key = key if key is not None else self._download_recording_key
+            view = self._recording_download_views.get(key)
+            if view is None:
+                return
+            view['panel'].pack(fill='x', padx=14, pady=(0, 12))
+            view['text'].set(text)
+            view['label'].configure(fg=color or self.palette['text'])
+            if active:
+                view['cancel'].pack(side='right', padx=(10, 0))
+                cancelling = key == self._download_recording_key and self._download_stop_event.is_set()
+                view['cancel'].configure(state='disabled' if cancelling else 'normal')
+            else:
+                view['cancel'].pack_forget()
+            bar = view['progress']
+            if value is None:
+                if str(bar.cget('mode')) != 'indeterminate':
+                    bar.configure(mode='indeterminate')
+                    bar.start(15)
+            else:
+                bar.stop()
+                bar.configure(mode='determinate', value=min(100, max(0, value)))
+
         def _render_recordings(
             self,
             recordings: list[RecordingItem],
@@ -711,6 +826,8 @@ def _run_gui_session() -> int:
                 scroll_position = 0.0
             for child in self.recordings_body.winfo_children():
                 child.destroy()
+            self._recording_action_buttons.clear()
+            self._recording_download_views.clear()
             if not recordings:
                 empty = tk.Frame(self.recordings_body, bg=self.palette['surface'])
                 empty.pack(fill='both', expand=True)
@@ -744,7 +861,15 @@ def _run_gui_session() -> int:
                     detail_parts.append(item.file_name)
                 if detail_parts:
                     tk.Label(text_box, text=' · '.join(detail_parts), fg=self.palette['muted'], bg=self.palette['panel'], font=('Segoe UI', 9)).pack(anchor='w', pady=(2, 0))
-                tk.Button(
+                save_button = tk.Button(
+                    row, text='Save', command=lambda selected=item: self._save_recording(selected),
+                    state='disabled' if self._download_worker_alive() else 'normal',
+                    relief='flat', bd=0, padx=12, pady=6,
+                    bg=self.palette['border'], fg=self.palette['text'],
+                    disabledforeground=self.palette['muted'], font=('Segoe UI Semibold', 10))
+                save_button.pack(side='right', padx=(12, 0))
+                self._recording_action_buttons.append(save_button)
+                play_button = tk.Button(
                     row,
                     text='Play',
                     command=lambda selected=item: self._on_recording_play(selected),
@@ -757,7 +882,30 @@ def _run_gui_session() -> int:
                     fg='white',
                     disabledforeground=self.palette['muted'],
                     font=('Segoe UI Semibold', 10),
-                ).pack(side='right', padx=(12, 0))
+                )
+                play_button.pack(side='right', padx=(12, 0))
+                self._recording_action_buttons.append(play_button)
+                download_panel = tk.Frame(card, bg=self.palette['panel'])
+                download_row = tk.Frame(download_panel, bg=self.palette['panel'])
+                download_row.pack(fill='x', pady=(0, 6))
+                download_text = tk.StringVar(value='')
+                download_label = tk.Label(
+                    download_row, textvariable=download_text, bg=self.palette['panel'],
+                    fg=self.palette['text'], anchor='w', justify='left', wraplength=600,
+                    font=('Segoe UI', 9))
+                download_label.pack(side='left', fill='x', expand=True)
+                download_row.bind('<Configure>', lambda event, label=download_label:
+                                  label.configure(wraplength=max(120, event.width - 100)))
+                download_cancel = tk.Button(
+                    download_row, text='Cancel', command=self._cancel_recording_save,
+                    relief='flat', bd=0, padx=12, pady=6,
+                    bg=self.palette['border'], fg=self.palette['text'])
+                download_bar = ttk.Progressbar(download_panel, maximum=100)
+                download_bar.pack(fill='x')
+                self._recording_download_views[_recording_key(item)] = {
+                    'panel': download_panel, 'text': download_text, 'label': download_label,
+                    'progress': download_bar, 'cancel': download_cancel,
+                }
             self.recordings_canvas.configure(scrollregion=self.recordings_canvas.bbox('all'))
             try:
                 self.recordings_canvas.yview_moveto(scroll_position)
@@ -812,8 +960,14 @@ def _run_gui_session() -> int:
             tk.Label(top, textvariable=self.messages_count_var, fg=self.palette['muted'], bg=self.palette['panel'], font=('Segoe UI', 10)).pack(side='right', padx=14)
 
             self.messages_status_var = tk.StringVar(value='')
+            self.message_save_notice = tk.Label(
+                shell, textvariable=self._message_save_notice_var, bg=self.palette['panel'],
+                fg=self.palette['text'], anchor='w', justify='left', font=('Segoe UI', 9))
+            self.message_save_notice.bind('<Configure>', lambda event:
+                                          self.message_save_notice.configure(wraplength=max(120, event.width - 20)))
 
             body_shell = tk.Frame(shell, bg=self.palette['surface'])
+            self.messages_body_shell = body_shell
             body_shell.pack(fill='both', expand=True, padx=18, pady=(0, 18))
             self.messages_canvas = tk.Canvas(body_shell, bg=self.palette['surface'], highlightthickness=0, bd=0)
             self.messages_scrollbar = tk.Scrollbar(body_shell, orient='vertical', command=self.messages_canvas.yview)
@@ -884,14 +1038,19 @@ def _run_gui_session() -> int:
                     req = urllib.request.Request(url, headers={'User-Agent': 'xmplayer'})
                     context = ssl._create_unverified_context() if str(url).lower().startswith('https://') else None
                     with urllib.request.urlopen(req, timeout=4, context=context) as response:
-                        data = response.read(1_500_000)
-                    image = self.Image.open(BytesIO(data)).convert('RGB')
+                        data = response.read(16 * 1024 * 1024 + 1)
+                    if len(data) > 16 * 1024 * 1024:
+                        continue
+                    with self.Image.open(BytesIO(data)) as original:
+                        original_format = original.format or 'PNG'
+                        image = original.convert('RGB')
                     if self.config_data.display_mode == 'stacked_split' or image.height > image.width:
                         image = _stacked_split_view(image, self.Image)
                     full_image = image.copy()
                     thumb_image = image.copy()
                     thumb_image.thumbnail((230, 124))
-                    row_thumbs.append({'thumb': thumb_image.copy(), 'full': full_image})
+                    row_thumbs.append({'thumb': thumb_image.copy(), 'full': full_image,
+                                       'data': data, 'format': original_format})
                 except Exception:
                     continue
             return row_thumbs
@@ -912,7 +1071,10 @@ def _run_gui_session() -> int:
             self._message_thumb_images.clear()
             self._message_thumb_refs.clear()
             self._message_thumb_hosts.clear()
+            self._close_message_image()
             self._message_full_images.clear()
+            self._message_image_data.clear()
+            self._message_timestamps = {index: item.timestamp for index, item in enumerate(messages)}
             for child in self.messages_body.winfo_children():
                 child.destroy()
             if not messages:
@@ -961,6 +1123,7 @@ def _run_gui_session() -> int:
                     child.destroy()
                 for key in [key for key in self._message_full_images if key[0] == index]:
                     self._message_full_images.pop(key, None)
+                    self._message_image_data.pop(key, None)
                 refs: list[Any] = []
                 for thumb_index, item in enumerate(item_thumbs or []):
                     if isinstance(item, dict):
@@ -972,10 +1135,24 @@ def _run_gui_session() -> int:
                     if thumb is None:
                         continue
                     self._message_full_images[(index, thumb_index)] = full_image
+                    original_data = item.get('data') if isinstance(item, dict) else None
+                    if original_data:
+                        self._message_image_data[(index, thumb_index)] = (original_data, item.get('format') or 'PNG')
                     photo = self.ImageTk.PhotoImage(thumb)
                     refs.append(photo)
+                    image_row = tk.Frame(host, bg=self.palette['panel'])
+                    image_row.pack(side='left', padx=(6 if thumb_index else 0, 0))
+                    if original_data:
+                        tk.Button(
+                            image_row, image=self._message_save_icon, text='Save image', compound='none',
+                            command=lambda key=(index, thumb_index): self._save_message_image(key),
+                            relief='flat', bd=0, bg=self.palette['panel'],
+                            activebackground=self.palette['border'], cursor='hand2',
+                            highlightthickness=1, highlightbackground=self.palette['panel'],
+                            highlightcolor=self.palette['accent'], padx=6, pady=6,
+                        ).pack(side='left', padx=(0, 8))
                     label = tk.Label(
-                        host,
+                        image_row,
                         image=photo,
                         bg=self.palette['panel'],
                         bd=0,
@@ -984,7 +1161,7 @@ def _run_gui_session() -> int:
                         pady=0,
                         cursor='hand2',
                     )
-                    label.pack(side='left', padx=(6 if thumb_index else 0, 0), pady=0)
+                    label.pack(side='left')
                     label.bind('<Button-1>', lambda _event, row=index, pos=thumb_index: self._show_message_image(row, pos))
                     label.bind('<ButtonRelease-1>', lambda _event, row=index, pos=thumb_index: self._show_message_image(row, pos))
                 if refs:
@@ -992,6 +1169,39 @@ def _run_gui_session() -> int:
                 else:
                     self._message_thumb_refs.pop(index, None)
             self.messages_canvas.configure(scrollregion=self.messages_canvas.bbox('all'))
+
+        def _set_message_save_notice(self, text: str, color: str) -> None:
+            self._message_save_notice_var.set(text)
+            self.message_save_notice.configure(fg=color)
+            self.message_save_notice.pack(fill='x', padx=18, pady=(0, 8), before=self.messages_body_shell)
+            if self._message_viewer_save_notice is not None:
+                self._message_viewer_save_notice.configure(fg=color)
+                self._message_viewer_save_notice.place(relx=0.5, rely=0.97, relwidth=0.92, anchor='s')
+
+        def _save_message_image(self, key: tuple[int, int] | None = None) -> None:
+            key = key if key is not None else self._message_viewer_key
+            source = self._message_image_data.get(key)
+            if source is None:
+                self._set_message_save_notice('Image unavailable. Reload messages and open the image again.', self.palette['danger'])
+                return
+            data, image_format = source
+            extension = {'JPEG': '.jpg', 'PNG': '.png', 'WEBP': '.webp', 'GIF': '.gif', 'BMP': '.bmp'}.get(image_format.upper(), '.png')
+            stamp = self._message_timestamps.get(key[0], '')
+            selected = filedialog.asksaveasfilename(
+                parent=self, title='Save message image', initialdir=str(self._save_directory),
+                initialfile=f'message_{file_stem(stamp)}_{key[1] + 1}{extension}',
+                defaultextension=extension,
+                filetypes=[('Original image', '*' + extension), ('PNG image', '*.png'), ('JPEG image', '*.jpg')])
+            if not selected:
+                return
+            destination = Path(selected)
+            try:
+                save_message_image(data, destination, image_format)
+            except Exception as exc:
+                self._set_message_save_notice(f'Could not save image: {exc}', self.palette['danger'])
+                return
+            self._save_directory = destination.parent
+            self._set_message_save_notice(f'Saved: {destination}', self.palette['accent'])
 
         def _message_image_keys(self) -> list[tuple[int, int]]:
             return sorted(self._message_full_images)
@@ -1123,6 +1333,15 @@ def _run_gui_session() -> int:
             ).pack(side='left')
             tk.Button(zoom_controls, text='-', command=lambda: self._change_message_viewer_zoom(-0.2), **button_style).pack(side='left')
             tk.Button(zoom_controls, text='Fit', command=lambda: self._set_message_viewer_zoom(1.0), **button_style).pack(side='left', padx=(8, 0))
+            tk.Button(zoom_controls, text='Save', command=self._save_message_image, **button_style).pack(side='left', padx=(8, 0))
+            self._message_viewer_save_notice = tk.Label(
+                viewer, textvariable=self._message_save_notice_var, bg=self.palette['panel'],
+                fg=self.message_save_notice.cget('fg'), anchor='w', justify='left',
+                padx=12, pady=8, font=('Segoe UI', 9))
+            self._message_viewer_save_notice.bind('<Configure>', lambda event:
+                event.widget.configure(wraplength=max(120, event.width - 24)))
+            if self._message_save_notice_var.get():
+                self._message_viewer_save_notice.place(relx=0.5, rely=0.97, relwidth=0.92, anchor='s')
 
             self.bind('<Up>', lambda _event: self._navigate_message_image(-1))
             self.bind('<Down>', lambda _event: self._navigate_message_image(1))
@@ -1138,6 +1357,7 @@ def _run_gui_session() -> int:
         def _close_message_image(self) -> None:
             viewer = self._message_viewer
             self._message_viewer = None
+            self._message_viewer_save_notice = None
             self._message_viewer_key = None
             self._message_viewer_photo = None
             self._message_viewer_source = None
@@ -1436,6 +1656,7 @@ def _run_gui_session() -> int:
             if not self._button_widgets:
                 return
             worker_alive = self._worker_alive()
+            downloading = self._download_worker_alive()
             restart_waiting = self._restart_pending or self._restart_after_id is not None
             if self._stop_pending and not worker_alive:
                 self._stop_pending = False
@@ -1444,10 +1665,10 @@ def _run_gui_session() -> int:
             def _state(enabled: bool) -> str:
                 return 'normal' if enabled and not self._closing else 'disabled'
 
-            play_enabled = not worker_alive and not restart_waiting and not stopping
+            play_enabled = not worker_alive and not restart_waiting and not stopping and not downloading
             stop_enabled = (worker_alive or restart_waiting) and not stopping
-            reconnect_enabled = not stopping and not restart_waiting
-            quality_enabled = not stopping and not restart_waiting
+            reconnect_enabled = not stopping and not restart_waiting and not downloading
+            quality_enabled = not stopping and not restart_waiting and not downloading
             screenshot_enabled = self._last_pil_image is not None
             ptz_enabled = worker_alive and self._current_recording is None and not stopping and not restart_waiting
 
@@ -1488,6 +1709,9 @@ def _run_gui_session() -> int:
                 )
             if not ptz_enabled:
                 self._hide_ptz_panel()
+            for button in self._recording_action_buttons:
+                button.configure(state=_state(not downloading))
+            self.recordings_refresh_button.configure(state=_state(not downloading and not self._recordings_worker_alive()))
 
         def _on_play(self) -> None:
             if self._worker_alive() or self._restart_pending or self._restart_after_id is not None:
@@ -1654,6 +1878,9 @@ def _run_gui_session() -> int:
                 ).start()
 
         def _start_session(self, *, reconnect: bool, recording: RecordingItem | None = None) -> None:
+            if self._download_worker_alive():
+                self._set_state('Idle', 'Wait for the recording to finish saving, or cancel it first')
+                return
             if self._closing:
                 return
             if not shutil.which(self.config_data.ffmpeg_path):
@@ -1736,7 +1963,7 @@ def _run_gui_session() -> int:
                     on_frame=lambda image: (
                         None
                         if master_stop_event.is_set() or self._closing or generation != self._session_generation
-                        else self._ui_queue.put(('frame', image.copy(), generation))
+                        else self._ui_queue.put(('frame', image, generation))
                     ),
                     output_fps=self.config_data.playback_fps if recording is not None else None,
                 )
@@ -1958,6 +2185,10 @@ def _run_gui_session() -> int:
                         frame_queue_limit = 90
                         if self._current_recording is not None:
                             frame_queue_limit = max(240, int(self.config_data.playback_fps * 60))
+                        # Bound memory as well as frame count now that HD keeps
+                        # the camera's full resolution.
+                        frame_bytes = payload.width * payload.height * len(payload.getbands())
+                        frame_queue_limit = min(frame_queue_limit, max(1, (64 * 1024 * 1024) // max(frame_bytes, 1)))
                         while len(self._pending_frames) > frame_queue_limit:
                             self._pending_frames.popleft()
                     elif kind == 'capture':
@@ -1993,6 +2224,24 @@ def _run_gui_session() -> int:
                         if generation is not None and generation != self._messages_generation:
                             continue
                         self._handle_messages_error(str(payload))
+                    elif kind == 'download_progress':
+                        if extra != self._download_recording_key or not self._download_stop_event.is_set():
+                            self._set_recording_save_progress(*payload, key=extra)
+                    elif kind in {'download_done', 'download_cancelled', 'download_error'}:
+                        if kind == 'download_done':
+                            if payload.warning:
+                                self._set_recording_save_progress(
+                                    100, f'Saved: {payload.path}\n{payload.warning}', key=extra,
+                                    color=self.palette['warn'], active=False)
+                            else:
+                                self._set_recording_save_progress(100, f'Saved: {payload.path}', key=extra,
+                                                                   color=self.palette['accent'], active=False)
+                        elif kind == 'download_cancelled':
+                            self._set_recording_save_progress(0, 'Saving cancelled', key=extra,
+                                                               color=self.palette['muted'], active=False)
+                        else:
+                            self._set_recording_save_progress(0, f'Could not save recording: {payload}', key=extra,
+                                                               color=self.palette['danger'], active=False)
             except queue.Empty:
                 queue_drained = True
                 pass
@@ -2002,6 +2251,7 @@ def _run_gui_session() -> int:
 
         def _on_close(self) -> None:
             self._closing = True
+            self._download_stop_event.set()
             if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
                 self._wifi_dialog.close()
             self._close_message_image()

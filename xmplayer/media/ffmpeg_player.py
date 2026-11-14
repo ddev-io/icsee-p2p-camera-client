@@ -3,10 +3,40 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+
+def _read_ppm_frame(stream: BinaryIO) -> tuple[int, int, bytes] | None:
+    """Read one FFmpeg RGB frame, including its actual width and height."""
+    fields: list[bytes] = []
+    header_size = 0
+    while len(fields) < 4:
+        line = stream.readline(256)
+        if not line:
+            if not fields:
+                return None
+            raise EOFError('Incomplete video frame header')
+        header_size += len(line)
+        if header_size > 1024 or not line.endswith(b'\n'):
+            raise ValueError('Invalid video frame header')
+        fields.extend(line.split(b'#', 1)[0].split())
+    if len(fields) != 4 or fields[0] != b'P6' or fields[3] != b'255':
+        raise ValueError('Expected an 8-bit RGB video frame')
+    width, height = int(fields[1]), int(fields[2])
+    if width <= 0 or height <= 0 or width * height > 64 * 1024 * 1024:
+        raise ValueError('Invalid video frame dimensions')
+    remaining = width * height * 3
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError('Incomplete video frame')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return width, height, chunks[0] if len(chunks) == 1 else b''.join(chunks)
 
 
 class FFmpegFrameDecoder:
@@ -113,11 +143,14 @@ class FFmpegFrameDecoder:
 
 
 class FFmpegStreamDecoder:
-    def __init__(self, ffmpeg_path: str = 'ffmpeg', *, width: int = 1280, height: int = 720) -> None:
+    def __init__(self, ffmpeg_path: str = 'ffmpeg', *, width: int | None = None, height: int | None = None) -> None:
+        if (width is None) != (height is None):
+            raise ValueError('Specify both output dimensions or neither')
+        if width is not None and height is not None and (width <= 0 or height <= 0):
+            raise ValueError('Output dimensions must be positive')
         self.ffmpeg_path = ffmpeg_path
         self.width = width
         self.height = height
-        self.frame_size = width * height * 3
         self._process: subprocess.Popen[bytes] | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -131,24 +164,29 @@ class FFmpegStreamDecoder:
         _ = output_fps
         self._on_frame = on_frame
         self._stop_event.clear()
-        vf = f'scale=w={self.width}:h={self.height}:force_original_aspect_ratio=decrease,pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:black'
         cmd = [
             self.ffmpeg_path,
             '-loglevel', 'error',
             '-flags', 'low_delay',
             '-f', 'hevc',
             '-i', 'pipe:0',
-            '-vf', vf,
-            '-f', 'rawvideo',
-            '-pix_fmt', 'rgb24',
-            'pipe:1',
         ]
+        if self.width is not None and self.height is not None:
+            vf = f'scale=w={self.width}:h={self.height}:force_original_aspect_ratio=decrease,pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:black'
+            cmd.extend(['-vf', vf])
+        # PPM carries dimensions with every frame, so native HD and resolution
+        # changes do not require a second probe or a fixed rawvideo frame size.
+        cmd.extend([
+            '-c:v', 'ppm',
+            '-pix_fmt', 'rgb24',
+            '-f', 'image2pipe',
+            'pipe:1',
+        ])
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=self.frame_size * 2,
             creationflags=CREATE_NO_WINDOW,
         )
         self._process = process
@@ -159,12 +197,13 @@ class FFmpegStreamDecoder:
                     if process.stdout is None:
                         break
                     try:
-                        chunk = process.stdout.read(self.frame_size)
-                    except (ValueError, OSError):
+                        frame = _read_ppm_frame(process.stdout)
+                    except (ValueError, OSError, EOFError):
                         break
-                    if not chunk or len(chunk) < self.frame_size:
+                    if frame is None:
                         break
-                    image = Image.frombytes('RGB', (self.width, self.height), chunk)
+                    width, height, pixels = frame
+                    image = Image.frombytes('RGB', (width, height), pixels)
                     if self._on_frame is not None:
                         self._on_frame(image)
             finally:
@@ -190,21 +229,19 @@ class FFmpegStreamDecoder:
         self._stop_event.set()
         if process is None:
             return
-        try:
-            if process.stdin:
-                process.stdin.close()
-        except Exception:
-            pass
-        try:
-            if process.stdout:
-                process.stdout.close()
-        except Exception:
-            pass
+        # End the process before closing buffered pipes: a reader or writer may
+        # be waiting for the remainder of a full-resolution frame.
         try:
             process.terminate()
             process.wait(timeout=1.5)
         except Exception:
             try:
                 process.kill()
+            except Exception:
+                pass
+        for pipe in (process.stdin, process.stdout):
+            try:
+                if pipe:
+                    pipe.close()
             except Exception:
                 pass
