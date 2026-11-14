@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..config.loader import MonitorConfig, validate_cloud_login_file
+from ..config.loader import MonitorConfig
 from . import legacy_api, legacy_cli, service
 
 WIFI_CONFIG = 'NetWork.Wifi'
@@ -142,15 +142,13 @@ def _command(
     stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     service._raise_if_cancelled(stop_event)
-    issue = validate_cloud_login_file(config.cloud_login_file)
-    if issue:
-        raise service.MonitorCaptureError(issue)
+    login_text = service._connection_login_text(config)
     serial = config.device_id.strip()
     if not serial:
         raise service.MonitorCaptureError('Select a camera before configuring Wi-Fi')
     authcode, _auth_info, admin_token, _admin_info = service._load_or_refresh_rps_tokens(
         config,
-        raw_text=config.cloud_login_file.read_text(encoding='utf-8-sig'),
+        raw_text=login_text,
         serial_number=serial,
         refresh_timeout=max(timeout, 12),
         runtime_mode=config.runtime_mode,
@@ -165,11 +163,7 @@ def _command(
         'plain_payload_text': json.dumps(payload, ensure_ascii=False, separators=(',', ':')),
         'delay_before': 0.2, 'stop_after_response_cmd': cmd + 1,
     }
-    chain = legacy_api.RpsLiveChain(
-        status_base=legacy_api.DEFAULT_STATUS_BASE,
-        status_user_agent=legacy_api.DEFAULT_STATUS_UA,
-        status_content_type='text/html', status_ssl_verify=False, agent_ssl_verify=False,
-    )
+    chain = service._make_rps_chain(config, _auth_info)
     servers = service._recording_server_attempts(service._cached_status_servers(config, limit=2), None)
     # A lost response to a Wi-Fi write may mean the camera already switched
     # networks. Never send the write a second time automatically.
@@ -194,10 +188,11 @@ def _command(
             encrypted_session_hex_width=10, encrypted_stream_type='Extra1',
             encrypted_combine_mode='CONNECT_ALL', encrypted_trans_mode='TCP',
             encrypted_followup_frames=[followup], encrypted_followup_delay=0.0,
-            encrypted_login_followup=service._build_login_followup(serial, admin_token, config.controller_profile),
+            encrypted_login_followup=service._build_login_followup(serial, admin_token, config.controller_profile, config=config),
             encrypted_controller_auto=False, encrypted_controller_profile=config.controller_profile,
             plain_handoff=False, runtime_mode=config.runtime_mode, stop_event=stop_event,
         )
+        service._check_device_login(config, result)
         response = _find_response(result, name, cmd)
         if response is not None:
             ret = response.get('Ret')

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 import urllib.request
 
-from ..config.loader import MonitorConfig, load_monitor_config, validate_cloud_login_file
+from ..config.loader import MonitorConfig, load_monitor_config, validate_connection_credentials
 from ..core.service import (
     CaptureArtifacts,
     MonitorCancelled,
@@ -82,12 +82,9 @@ def _startup_issues(config: MonitorConfig) -> list[str]:
         importlib.import_module('PIL.ImageTk')
     except Exception as exc:
         issues.append(f'Pillow ImageTk bridge is unavailable: {exc}')
-    if not config.cloud_login_file.exists():
-        issues.append(f'cloud login file not found: {config.cloud_login_file}')
-    else:
-        login_issue = validate_cloud_login_file(config.cloud_login_file)
-        if login_issue:
-            issues.append(login_issue)
+    login_issue = validate_connection_credentials(config)
+    if login_issue:
+        issues.append(login_issue)
     return issues
 
 
@@ -104,82 +101,6 @@ def _show_startup_error(message: str) -> None:
         print(message)
 
 
-def _prompt_for_cloud_credentials(login_path: Path) -> bool:
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-    except Exception as exc:
-        _show_startup_error(f'Unable to show the sign-in window\n\n{exc}')
-        return False
-
-    try:
-        root = tk.Tk()
-    except Exception as exc:
-        _show_startup_error(f'Unable to show the sign-in window\n\n{exc}')
-        return False
-    root.title('Sign in to iCSee / XM')
-    root.configure(bg='#f4f6f8')
-    root.resizable(False, False)
-
-    login_var = tk.StringVar()
-    password_var = tk.StringVar()
-    submitted = {'value': False}
-
-    body = tk.Frame(root, bg='#f4f6f8', padx=28, pady=24)
-    body.pack(fill='both', expand=True)
-    tk.Label(
-        body,
-        text='Sign in to your camera app account',
-        bg='#f4f6f8',
-        fg='#18212b',
-        font=('Segoe UI Semibold', 14),
-    ).pack(anchor='w')
-    tk.Label(
-        body,
-        text='Use the username or email and password from the iCSee/XM mobile app.',
-        bg='#f4f6f8',
-        fg='#52606d',
-        font=('Segoe UI', 9),
-        justify='left',
-        wraplength=360,
-    ).pack(anchor='w', pady=(6, 18))
-
-    tk.Label(body, text='Username or email', bg='#f4f6f8', fg='#34414d', font=('Segoe UI', 9)).pack(anchor='w')
-    login_entry = tk.Entry(body, textvariable=login_var, width=42, font=('Segoe UI', 10))
-    login_entry.pack(fill='x', pady=(4, 14), ipady=5)
-    tk.Label(body, text='Password', bg='#f4f6f8', fg='#34414d', font=('Segoe UI', 9)).pack(anchor='w')
-    password_entry = tk.Entry(body, textvariable=password_var, show='*', width=42, font=('Segoe UI', 10))
-    password_entry.pack(fill='x', pady=(4, 20), ipady=5)
-
-    actions = tk.Frame(body, bg='#f4f6f8')
-    actions.pack(fill='x')
-
-    def cancel() -> None:
-        root.destroy()
-
-    def submit() -> None:
-        login = login_var.get().strip()
-        password = password_var.get()
-        if not login or not password:
-            messagebox.showerror('Sign in required', 'Enter your username or email and password.', parent=root)
-            return
-        try:
-            login_path.parent.mkdir(parents=True, exist_ok=True)
-            login_path.write_text(f'{login}\n{password}\n', encoding='utf-8')
-        except OSError as exc:
-            messagebox.showerror('Could not save sign-in details', str(exc), parent=root)
-            return
-        submitted['value'] = True
-        root.destroy()
-
-    tk.Button(actions, text='Cancel', command=cancel, width=12).pack(side='right')
-    tk.Button(actions, text='Sign in', command=submit, width=12, default='active').pack(side='right', padx=(0, 8))
-    root.protocol('WM_DELETE_WINDOW', cancel)
-    root.bind('<Return>', lambda _event: submit())
-    root.bind('<Escape>', lambda _event: cancel())
-    login_entry.focus_set()
-    root.mainloop()
-    return bool(submitted['value'])
 
 
 def _save_device_id(config_path: Path, device_id: str) -> None:
@@ -238,24 +159,30 @@ def _summarize_second_probe(result: dict[str, Any]) -> tuple[str, int]:
             best_status = status
     return best_status, best_data_frames
 
-def main() -> int:
+def _run_gui_session() -> int:
     try:
         config = load_monitor_config()
     except Exception as exc:
         _show_startup_error(f'Failed to load desktop_monitor.json\n\n{exc}')
         return 1
 
-    login_issue = validate_cloud_login_file(config.cloud_login_file)
+    login_issue = validate_connection_credentials(config)
     if login_issue:
-        if not _prompt_for_cloud_credentials(config.cloud_login_file):
+        try:
+            from .connection import prompt_for_connection
+            saved_path = prompt_for_connection(config)
+        except Exception as exc:
+            _show_startup_error(f'Unable to show the connection window\n\n{exc}')
+            return 1
+        if not saved_path:
             return 1
         try:
-            config = load_monitor_config()
+            config = load_monitor_config(saved_path)
         except Exception as exc:
             _show_startup_error(f'Failed to load desktop_monitor.json\n\n{exc}')
             return 1
 
-    if login_issue or not config.device_id:
+    if config.connection_mode == 'account' and (login_issue or not config.device_id):
         try:
             device_ids = discover_cloud_device_ids(config)
             _save_device_id(config.config_path, device_ids[0])
@@ -285,9 +212,7 @@ def main() -> int:
             self.title(f"xmplayer - {config.device_name}")
             self.geometry(f"{config.window.width}x{config.window.height}")
             self.configure(bg=self.palette['bg'])
-            if config.window.start_fullscreen:
-                self.attributes('-fullscreen', True)
-            else:
+            if not config.window.start_fullscreen:
                 try:
                     self.state('zoomed')
                 except Exception:
@@ -319,7 +244,12 @@ def main() -> int:
             self._section_pages: dict[str, Any] = {}
             self._active_section = 'live'
             self._closing = False
-            self._fullscreen = bool(config.window.start_fullscreen)
+            self._restart_app = False
+            self._fullscreen = False
+            self._fullscreen_after_id: str | None = None
+            self._video_resize_after_id: str | None = None
+            self._windowed_state = 'normal'
+            self._windowed_geometry = ''
             self._current_quality = config.default_quality
             self._video_layout = 'horizontal' if config.display_mode == 'stacked_split' else 'vertical'
             self._current_recording: RecordingItem | None = None
@@ -354,13 +284,17 @@ def main() -> int:
 
             self._build_ui()
             self.protocol('WM_DELETE_WINDOW', self._on_close)
+            self.bind('<Escape>', self._on_escape)
             self._poll_after_id = self.after(80, self._poll_queue)
             self._playback_after_id = self.after(self._frame_interval_ms, self._playback_tick)
             self._update_quality_badge()
             self._set_state('Idle', 'Ready to start')
+            if config.window.start_fullscreen:
+                self.after_idle(self._toggle_fullscreen)
 
         def _build_ui(self) -> None:
             header = tk.Frame(self, bg=self.palette['panel'], bd=0, highlightthickness=1, highlightbackground=self.palette['border'])
+            self.header = header
             header.pack(fill='x', padx=18, pady=(18, 10))
             left = tk.Frame(header, bg=self.palette['panel'])
             left.pack(side='left', fill='x', expand=True, padx=16, pady=14)
@@ -399,8 +333,12 @@ def main() -> int:
             self.quality_var = tk.StringVar(value=self._current_quality.upper())
             self.quality_badge = tk.Label(right, textvariable=self.quality_var, fg='white', bg=self.palette['badge_sd'], font=('Segoe UI', 10, 'bold'), padx=12, pady=6)
             self.quality_badge.pack(anchor='e')
+            tk.Label(right, text='Cloud ID' if config.connection_mode == 'cloud_id' else 'App account',
+                     fg=self.palette['muted'], bg=self.palette['panel'],
+                     font=('Segoe UI', 9)).pack(anchor='e', pady=(6, 0))
 
             tabbar = tk.Frame(self, bg=self.palette['bg'])
+            self.tabbar = tabbar
             tabbar.pack(fill='x', padx=18, pady=(0, 10))
             for key, label in (
                 ('live', 'Live'),
@@ -423,6 +361,17 @@ def main() -> int:
                 )
                 btn.pack(side='left', padx=(0, 8))
                 self._section_buttons[key] = btn
+                if key == 'messages' and config.connection_mode == 'cloud_id':
+                    btn.configure(state='disabled')
+
+            connection_button = tk.Button(
+                tabbar, text='Connection...', command=self._change_connection,
+                relief='flat', bd=0, padx=16, pady=10,
+                bg=self.palette['panel'], fg=self.palette['text'],
+                activebackground=self.palette['border'], activeforeground=self.palette['text'],
+                font=('Segoe UI Semibold', 11))
+            connection_button.pack(side='right', padx=(8, 0))
+            self._button_widgets['Connection'] = connection_button
 
             tk.Button(
                 tabbar, text='Camera Wi-Fi', command=self._open_wifi_settings,
@@ -454,8 +403,9 @@ def main() -> int:
 
             self.video_frame = tk.Frame(live_page, bg=self.palette['surface'], highlightthickness=1, highlightbackground=self.palette['border'])
             self.video_frame.pack(fill='both', expand=True, pady=(0, 10))
-            self.video_label = tk.Label(self.video_frame, bg=self.palette['surface'])
+            self.video_label = tk.Label(self.video_frame, bg=self.palette['surface'], bd=0, highlightthickness=0)
             self.video_label.pack(fill='both', expand=True)
+            self.video_frame.bind('<Configure>', self._schedule_video_redraw)
             self.video_mode_var = tk.StringVar(value='LIVE')
             self.video_mode_badge = tk.Label(
                 self.video_frame,
@@ -519,6 +469,7 @@ def main() -> int:
             self._build_ptz_panel()
 
             toolbar = tk.Frame(live_page, bg=self.palette['panel'], highlightthickness=1, highlightbackground=self.palette['border'])
+            self.toolbar = toolbar
             toolbar.pack(fill='x')
             buttons = [
                 ('Play', self._on_play, 'normal'),
@@ -556,6 +507,23 @@ def main() -> int:
             self._section_pages['recordings'] = self._build_recordings_page(self.section_host)
             self._section_pages['messages'] = self._build_messages_page(self.section_host)
             self._show_section('live')
+
+        def _change_connection(self) -> None:
+            if self._connection_busy():
+                return
+            if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
+                self._wifi_dialog.lift()
+                self._set_state('Idle', 'Close Camera Wi-Fi before changing connection')
+                return
+            from .connection import prompt_for_connection
+            if prompt_for_connection(self.config_data, parent=self):
+                self._restart_app = True
+                self._on_close()
+
+        def _connection_busy(self) -> bool:
+            return self._worker_alive() or any(
+                worker is not None and worker.is_alive()
+                for worker in (self._recordings_worker, self._messages_worker))
 
         def _open_wifi_settings(self) -> None:
             if self._wifi_dialog is not None and self._wifi_dialog.winfo_exists():
@@ -1156,7 +1124,6 @@ def main() -> int:
             tk.Button(zoom_controls, text='-', command=lambda: self._change_message_viewer_zoom(-0.2), **button_style).pack(side='left')
             tk.Button(zoom_controls, text='Fit', command=lambda: self._set_message_viewer_zoom(1.0), **button_style).pack(side='left', padx=(8, 0))
 
-            self.bind('<Escape>', self._close_message_image_event)
             self.bind('<Up>', lambda _event: self._navigate_message_image(-1))
             self.bind('<Down>', lambda _event: self._navigate_message_image(1))
             self.bind('<plus>', lambda _event: self._change_message_viewer_zoom(0.2))
@@ -1168,9 +1135,6 @@ def main() -> int:
             viewer.bind('<MouseWheel>', self._message_viewer_mousewheel)
             viewer.focus_set()
 
-        def _close_message_image_event(self, _event=None) -> None:
-            self._close_message_image()
-
         def _close_message_image(self) -> None:
             viewer = self._message_viewer
             self._message_viewer = None
@@ -1180,10 +1144,6 @@ def main() -> int:
             self._message_viewer_label = None
             self._message_viewer_zoom = 1.0
             self._message_viewer_zoom_var = None
-            try:
-                self.unbind('<Escape>')
-            except Exception:
-                pass
             try:
                 self.unbind('<Up>')
                 self.unbind('<Down>')
@@ -1251,7 +1211,7 @@ def main() -> int:
             self.video_mode_var.set('PLAYBACK' if playback else 'LIVE')
             self.video_mode_badge.configure(bg=accent)
             self.video_frame.configure(highlightbackground=accent if playback else self.palette['border'])
-            if playback:
+            if playback and not self._fullscreen:
                 self.playback_banner_var.set(f'Recording playback: {detail_text}')
                 self.playback_banner.configure(bg='#21190c', highlightbackground=accent)
                 self.playback_banner_label.configure(bg='#21190c')
@@ -1501,6 +1461,7 @@ def main() -> int:
                 'Fullscreen': True,
                 'Screenshot': screenshot_enabled,
                 'PTZ': ptz_enabled,
+                'Connection': not self._connection_busy() and not restart_waiting,
             }
             for name, enabled in mapping.items():
                 button = self._button_widgets.get(name)
@@ -1577,8 +1538,85 @@ def main() -> int:
             self._update_controls()
 
         def _toggle_fullscreen(self) -> None:
-            self._fullscreen = not self._fullscreen
-            self.attributes('-fullscreen', self._fullscreen)
+            if self._closing:
+                return
+            if not self._fullscreen:
+                self._windowed_state = self.state()
+                self._windowed_geometry = self.geometry()
+                self._show_section('live')
+                self._fullscreen = True
+                self.header.pack_forget()
+                self.tabbar.pack_forget()
+                self.section_host.pack_configure(padx=0, pady=0)
+                self.toolbar.pack_forget()
+                self.video_frame.pack_configure(pady=0)
+                self.video_frame.configure(highlightthickness=0)
+                self.video_mode_badge.place_forget()
+                self._update_mode_chrome()
+                self.attributes('-fullscreen', True)
+                self.focus_set()
+                self._fullscreen_after_id = self.after(100, self._sync_fullscreen_controls)
+            else:
+                self._fullscreen = False
+                if self._fullscreen_after_id is not None:
+                    self.after_cancel(self._fullscreen_after_id)
+                    self._fullscreen_after_id = None
+                self.toolbar.place_forget()
+                self.video_frame.pack_configure(pady=(0, 10))
+                self.video_frame.configure(highlightthickness=1)
+                self.toolbar.pack(fill='x')
+                self.section_host.pack_configure(padx=18, pady=(0, 18))
+                self.header.pack(fill='x', padx=18, pady=(18, 10), before=self.section_host)
+                self.tabbar.pack(fill='x', padx=18, pady=(0, 10), after=self.header)
+                self.video_mode_badge.place(relx=0.012, rely=0.018, anchor='nw')
+                self._update_mode_chrome()
+                self.attributes('-fullscreen', False)
+                self.state(self._windowed_state)
+                if self._windowed_state == 'normal' and self._windowed_geometry:
+                    self.geometry(self._windowed_geometry)
+            self._schedule_video_redraw()
+
+        def _on_escape(self, _event=None) -> str:
+            if self._message_viewer is not None:
+                self._close_message_image()
+            elif self._fullscreen:
+                self._toggle_fullscreen()
+            return 'break'
+
+        def _sync_fullscreen_controls(self) -> None:
+            self._fullscreen_after_id = None
+            if self._closing or not self._fullscreen:
+                return
+            pointer_x, pointer_y = self.winfo_pointerxy()
+            left = self.video_frame.winfo_rootx()
+            top = self.video_frame.winfo_rooty()
+            width = self.video_frame.winfo_width()
+            height = self.video_frame.winfo_height()
+            reveal_height = max(self.toolbar.winfo_reqheight() + 16, 80)
+            near_bottom = (
+                left <= pointer_x < left + width
+                and top + max(height - reveal_height, 0) <= pointer_y < top + height
+            )
+            if near_bottom:
+                if self.toolbar.winfo_manager() != 'place':
+                    # Overlay the existing controls without resizing the video.
+                    self.toolbar.place(in_=self.video_frame, relx=0, rely=1, relwidth=1, anchor='sw')
+                    self.toolbar.lift()
+            elif self.toolbar.winfo_manager() == 'place':
+                self.toolbar.place_forget()
+            self._fullscreen_after_id = self.after(100, self._sync_fullscreen_controls)
+
+        def _schedule_video_redraw(self, _event=None) -> None:
+            if self._closing:
+                return
+            if self._video_resize_after_id is not None:
+                self.after_cancel(self._video_resize_after_id)
+            self._video_resize_after_id = self.after(60, self._redraw_video)
+
+        def _redraw_video(self) -> None:
+            self._video_resize_after_id = None
+            if not self._closing and self._last_pil_image is not None:
+                self._show_display_image(self._last_pil_image, hide_overlay=False)
 
         def _save_screenshot(self) -> None:
             if self._last_pil_image is None:
@@ -1835,10 +1873,11 @@ def main() -> int:
                 return _stacked_split_view(pil_image, self.Image)
             return pil_image
 
-        def _show_display_image(self, display_source) -> None:
+        def _show_display_image(self, display_source, *, hide_overlay: bool = True) -> None:
             self._last_pil_image = display_source
-            box_w = max(self.video_frame.winfo_width() - 8, 1)
-            box_h = max(self.video_frame.winfo_height() - 8, 1)
+            padding = 0 if self._fullscreen else 8
+            box_w = max(self.video_frame.winfo_width() - padding, 1)
+            box_h = max(self.video_frame.winfo_height() - padding, 1)
             width, height = _fit_size(display_source.width, display_source.height, box_w, box_h)
             display_image = display_source.resize((width, height)) if (width, height) != (display_source.width, display_source.height) else display_source
             self._last_tk_image = self.ImageTk.PhotoImage(display_image)
@@ -1846,7 +1885,8 @@ def main() -> int:
             self.video_mode_badge.lift()
             if self._ptz_panel_visible:
                 self.ptz_panel.lift()
-            self.overlay.place_forget()
+            if hide_overlay:
+                self.overlay.place_forget()
 
         def _render_frame(self, pil_image) -> None:
             self._last_source_image = pil_image
@@ -1979,6 +2019,8 @@ def main() -> int:
                 self._playback_after_id,
                 self._restart_after_id,
                 self._startup_progress_after_id,
+                self._fullscreen_after_id,
+                self._video_resize_after_id,
             ):
                 if after_id:
                     try:
@@ -2000,4 +2042,11 @@ def main() -> int:
 
     app = MonitorApp()
     app.mainloop()
-    return 0
+    return 2 if app._restart_app else 0
+
+
+def main() -> int:
+    while True:
+        result = _run_gui_session()
+        if result != 2:
+            return result

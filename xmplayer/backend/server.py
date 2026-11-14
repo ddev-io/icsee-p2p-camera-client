@@ -106,6 +106,7 @@ class BackendServer:
         return {
             'device_id': self.config.device_id,
             'device_name': self.config.device_name,
+            'connection_mode': self.config.connection_mode,
             'default_quality': self.config.default_quality,
             'playback_fps': self.config.playback_fps,
             'display_mode': self.config.display_mode,

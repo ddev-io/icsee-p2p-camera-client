@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from ..config.loader import MonitorConfig, validate_cloud_login_file
+from ..config.loader import MonitorConfig, validate_cloud_login_file, validate_connection_credentials
 from . import legacy_api, legacy_cli
 from .ams_regions import credential_identity
 
@@ -567,6 +567,27 @@ def _load_or_refresh_rps_tokens(
     progress_callback: Callable[[str], None] | None = None,
     force_refresh: bool = False,
 ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+    if getattr(config, 'connection_mode', 'account') == 'cloud_id':
+        from .cloud_id import CloudIdClient, CloudIdError
+        _emit_progress(progress_callback, 'Cloud ID service codes request')
+        _emit_status(status_callback, 'Connecting', 'Finding the camera by Cloud ID')
+        client = CloudIdClient(timeout=min(refresh_timeout, 10), ssl_verify=False)
+        try:
+            codes = client.auth_codes(serial_number)
+            status = client.discover_status(codes)
+        except CloudIdError as exc:
+            raise MonitorCaptureError(str(exc)) from None
+        if status.status != 'Online':
+            raise MonitorCaptureError('The camera is offline')
+        host = str(status.entry.get('ServerIP') or '')
+        port = str(status.entry.get('ServerPort') or '')
+        if not host or not port.isdigit():
+            raise MonitorCaptureError('The camera did not provide a connection address')
+        _emit_progress(progress_callback, 'Cloud ID service codes response')
+        return codes.for_service('rps'), {
+            'source': 'cloud_id', 'mode': 'device_password',
+            'status_server': [host, port],
+        }, '', {'source': 'device_credentials', 'mode': 'password'}
     if not force_refresh:
         cached = _load_token_cache(config, serial_number=serial_number, runtime_mode=runtime_mode)
         if cached is not None:
@@ -1156,6 +1177,9 @@ def _fetch_alarm_storage_count(
 
 
 def discover_cloud_device_ids(config: MonitorConfig, *, timeout: int = 20) -> list[str]:
+    if getattr(config, 'connection_mode', 'account') == 'cloud_id':
+        _connection_login_text(config)
+        return [config.device_id]
     login_issue = validate_cloud_login_file(config.cloud_login_file)
     if login_issue:
         raise MonitorCaptureError(login_issue)
@@ -1188,6 +1212,8 @@ def discover_cloud_device_ids(config: MonitorConfig, *, timeout: int = 20) -> li
 
 
 def fetch_monitor_messages(config: MonitorConfig, *, limit: int = 30, timeout: int = 12) -> tuple[list[MonitorMessage], dict[str, Any]]:
+    if getattr(config, 'connection_mode', 'account') == 'cloud_id':
+        raise MonitorCaptureError('Cloud messages require app account sign-in')
     login_issue = validate_cloud_login_file(config.cloud_login_file)
     if login_issue:
         raise MonitorCaptureError(login_issue)
@@ -1351,7 +1377,49 @@ def _summarize_live_result(result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-def _build_login_followup(serial_number: str, admin_token: str, controller_profile: str) -> dict[str, Any]:
+def _connection_login_text(config: MonitorConfig) -> str:
+    issue = validate_connection_credentials(config)
+    if issue:
+        raise MonitorCaptureError(issue)
+    if getattr(config, 'connection_mode', 'account') == 'cloud_id':
+        return ''
+    return config.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore')
+
+
+def _make_rps_chain(config: MonitorConfig, auth_info: dict[str, Any]) -> legacy_api.RpsLiveChain:
+    server = auth_info.get('status_server') if getattr(config, 'connection_mode', 'account') == 'cloud_id' else None
+    return legacy_api.RpsLiveChain(
+        status_base=legacy_api.DEFAULT_STATUS_BASE,
+        status_user_agent=legacy_api.DEFAULT_STATUS_UA,
+        status_content_type='text/html', status_ssl_verify=False, agent_ssl_verify=False,
+        preferred_status_server=tuple(server) if server else None,
+    )
+
+
+def _check_device_login(config: MonitorConfig, result: dict[str, Any]) -> None:
+    if getattr(config, 'connection_mode', 'account') != 'cloud_id':
+        return
+    frames = ((result.get('tcp_encrypted_probe') or {}).get('frames') or {}).get('control_frames') or []
+    for frame in frames:
+        if frame.get('cmd') != 0x03E9:
+            continue
+        ret = _control_frame_json(frame).get('Ret')
+        if ret in {203, 204, 205, 206, 214, 215}:
+            detail = ('The camera user is locked. Try again later.' if ret == 205 else
+                      'The camera rejected sign-in. Check its username and password.')
+            raise MonitorCaptureError(f'{detail} (code {ret})')
+
+
+def _build_login_followup(serial_number: str, admin_token: str, controller_profile: str,
+                          *, config: MonitorConfig | None = None) -> dict[str, Any]:
+    if config is not None and getattr(config, 'connection_mode', 'account') == 'cloud_id':
+        return {
+            'username': config.device_username, 'password': config.device_password,
+            'mode': 'password', 'login_type': 'DVRIP-Web',
+            'random_a': legacy_api._generate_ascii_key(32),
+            'user_agent': legacy_cli.DEFAULT_6611_LOGIN_USER_AGENT,
+            **({'msg_id': 0x38} if controller_profile == 'app_reference_first_6611' else {}),
+        }
     token_username = legacy_api.derive_futurehome_token_username(serial_number, admin_token) if admin_token else ''
     followup = {
         'username': '',
@@ -1618,13 +1686,14 @@ def _query_device_recordings_page(
             encrypted_trans_mode='TCP',
             encrypted_followup_frames=[followup],
             encrypted_followup_delay=0.0,
-            encrypted_login_followup=_build_login_followup(serial_number, admin_token, controller_profile),
+            encrypted_login_followup=_build_login_followup(serial_number, admin_token, controller_profile, config=config),
             encrypted_controller_auto=False,
             encrypted_controller_profile=controller_profile,
             plain_handoff=False,
             runtime_mode=config.runtime_mode,
             stop_event=stop_event,
         )
+        _check_device_login(config, result)
         response, page_meta = _find_opfilequery_response(result)
         page_meta.update({'begin_time': begin_time, 'end_time': end_time})
         failure_detail = describe_capture_failure(result)
@@ -1647,10 +1716,7 @@ def fetch_device_recordings(
     stop_event: threading.Event | None = None,
 ) -> tuple[list[RecordingItem], dict[str, Any]]:
     _raise_if_cancelled(stop_event)
-    login_issue = validate_cloud_login_file(config.cloud_login_file)
-    if login_issue:
-        raise MonitorCaptureError(login_issue)
-    raw_text = config.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore') if config.cloud_login_file.exists() else ''
+    raw_text = _connection_login_text(config)
     serial_number = config.device_id.strip()
     if not serial_number:
         raise MonitorCaptureError('device_id is empty')
@@ -1667,13 +1733,7 @@ def fetch_device_recordings(
         runtime_mode=config.runtime_mode,
         status_callback=None,
     )
-    chain = legacy_api.RpsLiveChain(
-        status_base=legacy_api.DEFAULT_STATUS_BASE,
-        status_user_agent=legacy_api.DEFAULT_STATUS_UA,
-        status_content_type='text/html',
-        status_ssl_verify=False,
-        agent_ssl_verify=False,
-    )
+    chain = _make_rps_chain(config, authcode_refresh)
     controller_profile = config.controller_profile
     cached_servers = _cached_status_servers(config, limit=2)
     preferred_server: tuple[str, str] | None = None
@@ -1787,6 +1847,7 @@ def fetch_device_recordings(
     return recordings, meta
 
 
+
 def _recording_end_time(item: RecordingItem) -> str:
     if item.end_time:
         return item.end_time
@@ -1884,10 +1945,7 @@ def run_recording_playback_stream(
     capture_seconds: float | None = None,
 ) -> CaptureArtifacts:
     _raise_if_cancelled(stop_event)
-    login_issue = validate_cloud_login_file(config.cloud_login_file)
-    if login_issue:
-        raise MonitorCaptureError(login_issue)
-    raw_text = config.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore') if config.cloud_login_file.exists() else ''
+    raw_text = _connection_login_text(config)
     serial_number = config.device_id.strip()
     if not serial_number:
         raise MonitorCaptureError('device_id is empty')
@@ -1915,14 +1973,8 @@ def run_recording_playback_stream(
         progress_callback=progress.emit,
     )
 
-    chain = legacy_api.RpsLiveChain(
-        status_base=legacy_api.DEFAULT_STATUS_BASE,
-        status_user_agent=legacy_api.DEFAULT_STATUS_UA,
-        status_content_type='text/html',
-        status_ssl_verify=False,
-        agent_ssl_verify=False,
-    )
-    encrypted_login_followup = _build_login_followup(serial_number, admin_token, controller_profile)
+    chain = _make_rps_chain(config, authcode_refresh)
+    encrypted_login_followup = _build_login_followup(serial_number, admin_token, controller_profile, config=config)
     base_client_token = _agent_client_token(config)
     playback_followups = [
         _build_opplayback_followup(
@@ -2046,6 +2098,7 @@ def run_recording_playback_stream(
             plain_handoff_extend_on_activity=True,
             progress_callback=progress.emit,
         )
+        _check_device_login(config, result)
         progress.emit(f'Recording playback attempt {attempt_index}/{attempt_count} response {result.get("status") or "unknown"}')
         if status_server_override:
             result['status_server_override'] = f'{status_server_override[0]}:{status_server_override[1]}'
@@ -2088,6 +2141,7 @@ def run_recording_playback_stream(
     )
 
 
+
 def run_monitor_capture(
     config: MonitorConfig,
     *,
@@ -2102,12 +2156,7 @@ def run_monitor_capture(
     include_agent_response_metadata: bool = False,
 ) -> CaptureArtifacts:
     _raise_if_cancelled(stop_event)
-    raw_text = ''
-    login_issue = validate_cloud_login_file(config.cloud_login_file)
-    if login_issue:
-        raise MonitorCaptureError(login_issue)
-    if config.cloud_login_file.exists():
-        raw_text = config.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore')
+    raw_text = _connection_login_text(config)
     serial_number = config.device_id.strip()
     if not serial_number:
         raise MonitorCaptureError('device_id is empty')
@@ -2134,14 +2183,8 @@ def run_monitor_capture(
     )
 
     _raise_if_cancelled(stop_event)
-    chain = legacy_api.RpsLiveChain(
-        status_base=legacy_api.DEFAULT_STATUS_BASE,
-        status_user_agent=legacy_api.DEFAULT_STATUS_UA,
-        status_content_type='text/html',
-        status_ssl_verify=False,
-        agent_ssl_verify=False,
-    )
-    encrypted_login_followup = _build_login_followup(serial_number, admin_token, controller_profile)
+    chain = _make_rps_chain(config, authcode_refresh)
+    encrypted_login_followup = _build_login_followup(serial_number, admin_token, controller_profile, config=config)
     base_client_token = _agent_client_token(config)
     best_result: dict[str, Any] | None = None
     all_results: list[dict[str, Any]] = []
@@ -2207,6 +2250,7 @@ def run_monitor_capture(
             progress_callback=progress_callback,
             include_agent_response_metadata=include_agent_response_metadata,
         )
+        _check_device_login(config, result)
         result['attempt_index'] = attempt_index
         result['quality'] = quality
         result['authcode_refresh'] = authcode_refresh
@@ -2244,6 +2288,7 @@ def run_monitor_capture(
     )
 
 
+
 def run_monitor_live_stream(
     config: MonitorConfig,
     *,
@@ -2255,12 +2300,7 @@ def run_monitor_live_stream(
     attempts: int | None = None,
 ) -> CaptureArtifacts:
     _raise_if_cancelled(stop_event)
-    raw_text = ''
-    login_issue = validate_cloud_login_file(config.cloud_login_file)
-    if login_issue:
-        raise MonitorCaptureError(login_issue)
-    if config.cloud_login_file.exists():
-        raw_text = config.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore')
+    raw_text = _connection_login_text(config)
     serial_number = config.device_id.strip()
     if not serial_number:
         raise MonitorCaptureError('device_id is empty')
@@ -2288,14 +2328,8 @@ def run_monitor_live_stream(
     )
 
     _raise_if_cancelled(stop_event)
-    chain = legacy_api.RpsLiveChain(
-        status_base=legacy_api.DEFAULT_STATUS_BASE,
-        status_user_agent=legacy_api.DEFAULT_STATUS_UA,
-        status_content_type='text/html',
-        status_ssl_verify=False,
-        agent_ssl_verify=False,
-    )
-    encrypted_login_followup = _build_login_followup(serial_number, admin_token, controller_profile)
+    chain = _make_rps_chain(config, authcode_refresh)
+    encrypted_login_followup = _build_login_followup(serial_number, admin_token, controller_profile, config=config)
     base_client_token = _agent_client_token(config)
     best_result: dict[str, Any] | None = None
     all_results: list[dict[str, Any]] = []
@@ -2392,6 +2426,7 @@ def run_monitor_live_stream(
             dynamic_followup_queue=ptz_queue,
             progress_callback=progress.emit,
         )
+        _check_device_login(config, result)
         progress.emit(f'Live attempt {attempt_index}/{attempt_count} response {result.get("status") or "unknown"}')
         if status_server_override:
             result['status_server_override'] = f'{status_server_override[0]}:{status_server_override[1]}'
@@ -2431,3 +2466,4 @@ def run_monitor_live_stream(
         quality=quality,
         attempt_count=attempt_count,
     )
+

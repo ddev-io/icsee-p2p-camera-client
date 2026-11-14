@@ -31,18 +31,69 @@ You need these installed in the Python/runtime environment used to start the GUI
 python run_gui.py
 ```
 
-3. On the first start, enter the username or email and password from the iCSee/XM mobile app. Do not use the camera's local network login and password.
-4. The app retrieves the first camera from the cloud account and stores its ID in `desktop_monitor.local.json`. This local file and `login.txt` are ignored by Git.
+3. Choose a connection method. **iCSee / XM account** uses the mobile app's username or email and account password, then retrieves the first camera on that account. **Cloud ID** uses the camera ID, its own username and its own password, without an app account. An empty camera password is supported.
+4. Connection settings are saved in the ignored `desktop_monitor.local.json`. Account credentials use the existing ignored `login.txt`; Cloud ID camera credentials are kept in the local configuration. To change the method or camera later, stop playback and click **Connection...**. Existing account sign-in details are preserved when switching to Cloud ID.
 5. Edit `desktop_monitor.json` if you need another window size or `ffmpeg_path`.
-   You can also tune live capture with:
-   - `capture_seconds`
-   - `max_frames`
-   - `attempts`
-   - `playback_fps`
-   The default values are intentionally long because the `app_reference_first_6611` profile needs a long first-6611 control window before second-flow media appears.
+
+You can also tune live capture with `capture_seconds`, `max_frames`, `attempts`,
+and `playback_fps`. The default values are intentionally long because the
+`app_reference_first_6611` profile needs a long first-6611 control window before
+second-flow media appears.
+
+Cloud ID supports live SD/HD playback through the existing Python RPS transport,
+with camera Wi-Fi and recording operations using the same device credentials.
+Cloud messages require an app account and are disabled in Cloud ID mode. A rejected
+camera password stops the connection attempt instead of retrying it automatically.
+
+If `ffmpeg_path` is left as `ffmpeg`, the app also looks for an existing portable
+executable at `ffmpeg/ffmpeg.exe` or `ffmpeg/bin/ffmpeg.exe` when it is absent from
+`PATH`. It is still checked only when playback starts.
+
+## Cloud ID diagnostics without an account
+
+The experimental status command obtains fresh service AuthCodes directly from
+`rs.xmeye.net/acquery/v3`, then queries the camera status service. It does not
+read `login.txt`, sign into an account, require the camera password, or load SDK
+libraries. Start it from the project folder and enter the Cloud ID when prompted:
+
+```powershell
+python -m xmplayer.core.legacy_cli cloud-id-status
+```
+
+The output distinguishes a valid `Online`/`Offline` response from a network,
+authorization, or response-matching error. Cloud IDs and AuthCodes are omitted
+from the output and from the optional `--out` report. `--service dss` selects DSS
+instead of RPS. By default an Offline LOCALQUERY response is checked again with
+MULTIQUERY: the same camera can return Offline to the former and Online with a
+usable relay route to the latter. `--multi` requests MULTIQUERY directly.
+
+To verify login with the camera's own username and password:
+
+```powershell
+python -m xmplayer.core.legacy_cli cloud-id-login-probe
+```
+
+The command prompts for Cloud ID, camera username, and camera password. It obtains
+fresh service codes, finds an RPS relay, negotiates encryption and verifies the
+camera's login response. It does not read the cloud account login or use a token
+copied from a phone. Only a matching login acknowledgment with `Ret:100` counts
+as success. Password rejections are reported without automatic retries.
+
+The connection closes after the check; this command does not start video. Its
+worker has a 60-second hard limit (`--deadline`) and reports its current stage
+and elapsed time. `--out` writes a result without credentials or session keys.
+
+If the result is `tls_verification_failed`, the optional `--insecure` flag disables
+certificate verification for either command. Both diagnostics use Python without
+loading FunSDK/NetSDK libraries and do not need FFmpeg.
+
+Cloud ID password login and live video have also been verified in the GUI on the
+target camera. No FunSDK/NetSDK runtime, phone, or cloud account is required for
+this connection method.
 
 ## Notes
 
+- **Fullscreen** shows only the video. Move the pointer to the bottom edge to reveal the playback controls; move it away to hide them. Press **Esc** or click **Fullscreen** again to restore the window.
 - **Camera Wi-Fi** opens a network settings window. Refresh reads `NetWork.Wifi` and asks the camera to scan nearby networks with `WifiAP` (command 1020). Choose a network from the camera's list and enter its Wi-Fi password. The SSID and security type come from the selected row; there is no manual SSID input. **Connect camera** sends the new settings after confirmation and stops video while the camera changes networks. Other network configuration fields are preserved. If scanning fails or returns no networks, connecting is disabled until a fresh scan succeeds.
 - Wi-Fi settings use the existing cloud/P2P connection; a connected Android phone, ADB, and Frida are not required. The password is not saved to a local file. If the camera disconnects before acknowledging the write, the program reports an unconfirmed save and requires a fresh settings read before another attempt.
 - The Wi-Fi commands follow the [FunSDK network settings example](https://github.com/jlinklab/jlink-funsdk-android-demo/blob/main/app/src/main/java/demo/xm/com/xmfunsdkdemo/ui/device/config/networksetting/presenter/NetworkSettingPresenter.java). Actual network switching must be verified on the target camera; local tests do not establish that it successfully joined the new network.

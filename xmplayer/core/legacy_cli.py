@@ -1311,6 +1311,93 @@ def cmd_status_probe(args: argparse.Namespace) -> int:
     return 0 if res.ok else 1
 
 
+def cmd_cloud_id_status(args: argparse.Namespace) -> int:
+    from .cloud_id import CloudIdClient, CloudIdError
+
+    cloud_id = str(args.device_id or '').strip() or input('Cloud ID: ').strip()
+    client = CloudIdClient(timeout=args.timeout, ssl_verify=not args.insecure)
+    try:
+        codes = client.auth_codes(cloud_id)
+        status = (client.device_status(codes, service=args.service, multi=True) if args.multi
+                  else client.discover_status(codes, service=args.service))
+        out = {'ok': True, 'account_login_used': False,
+               'device_authentication': 'not_attempted',
+               'auth_services': codes.available_services(), **status.safe_summary()}
+    except CloudIdError as exc:
+        out = {'ok': False, 'account_login_used': False,
+               'device_authentication': 'not_attempted',
+               'stage': exc.stage, 'error': exc.reason, 'code': exc.code}
+    if args.out:
+        Path(args.out).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding='utf-8')
+    _print_json(out)
+    return 0 if out['ok'] else 1
+
+
+def _cloud_id_login_worker(events, options: dict[str, Any]) -> None:
+    from .cloud_id import CloudIdClient, CloudIdError
+    try:
+        client = CloudIdClient(timeout=options['timeout'], ssl_verify=options['ssl_verify'])
+        result = client.probe_login(options['cloud_id'], username=options['username'],
+                                    password=options['password'], channel=options['channel'],
+                                    progress=lambda stage: events.put({'stage': stage}))
+    except CloudIdError as exc:
+        result = {'authenticated': False, 'account_login_used': False,
+                  'stage': exc.stage, 'error': exc.reason, 'code': exc.code}
+    except Exception as exc:  # Only fixed type metadata crosses the process boundary.
+        result = {'authenticated': False, 'account_login_used': False,
+                  'error': 'probe_failed', 'error_type': type(exc).__name__}
+    events.put({'result': result})
+
+
+def cmd_cloud_id_login_probe(args: argparse.Namespace) -> int:
+    import multiprocessing
+    import queue
+    import sys
+    import time
+
+    cloud_id = str(args.device_id or '').strip() or input('Cloud ID: ').strip()
+    username = str(args.device_user or '').strip() or input('Camera username [admin]: ').strip() or 'admin'
+    password = getpass.getpass('Camera password: ')
+    options = {'cloud_id': cloud_id, 'username': username, 'password': password,
+               'channel': args.channel, 'timeout': args.timeout, 'ssl_verify': not args.insecure}
+    multiprocessing.freeze_support()
+    context = multiprocessing.get_context('spawn')
+    events = context.Queue()
+    process = context.Process(target=_cloud_id_login_worker, args=(events, options))
+    started = time.monotonic()
+    deadline = started + max(1, args.deadline)
+    result = None
+    stage = 'starting'
+    process.start()
+    try:
+        while time.monotonic() < deadline:
+            try:
+                event = events.get(timeout=min(5, max(0.01, deadline - time.monotonic())))
+            except queue.Empty:
+                if not process.is_alive():
+                    break
+                print(f'Waiting: {stage} ({time.monotonic() - started:.0f}s)', file=sys.stderr, flush=True)
+                continue
+            if 'result' in event:
+                result = event['result']
+                break
+            stage = event['stage']
+            print(f'{stage} ({time.monotonic() - started:.1f}s)', file=sys.stderr, flush=True)
+        if result is None:
+            result = {'authenticated': False, 'account_login_used': False,
+                      'error': 'deadline' if time.monotonic() >= deadline else 'worker_exit',
+                      'last_stage': stage}
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=3)
+        events.close()
+    if args.out:
+        Path(args.out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    _print_json(result)
+    return 0 if result.get('authenticated') else 1
+
+
 def cmd_first_6611_harness(args: argparse.Namespace) -> int:
     text = _read_text(args.raw, args.file)
     device = _pick_device_from_text(text, args.device_id)
@@ -2002,6 +2089,27 @@ def cmd_build_6611_login(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="iCSee desktop reverse-engineering helper")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    cloud_id_status = sub.add_parser(
+        'cloud-id-status', help='Get fresh service codes and camera status by Cloud ID, without an account')
+    cloud_id_status.add_argument('--device-id', help='Cloud ID (prompted if omitted)')
+    cloud_id_status.add_argument('--service', choices=['dss', 'rps'], default='rps')
+    cloud_id_status.add_argument('--multi', action='store_true', help='Use MSG_STATUS_MULTIQUERY instead of LOCALQUERY')
+    cloud_id_status.add_argument('--timeout', type=int, default=7)
+    cloud_id_status.add_argument('--insecure', action='store_true', help='Disable TLS certificate verification')
+    cloud_id_status.add_argument('--out', help='Write safe status metadata, without Cloud ID or AuthCode')
+    cloud_id_status.set_defaults(func=cmd_cloud_id_status)
+
+    cloud_id_login = sub.add_parser(
+        'cloud-id-login-probe', help='Verify Cloud ID and camera credentials over RPS, without an account')
+    cloud_id_login.add_argument('--device-id', help='Cloud ID (prompted if omitted)')
+    cloud_id_login.add_argument('--device-user', help='Camera username (prompted if omitted)')
+    cloud_id_login.add_argument('--channel', type=int, default=0)
+    cloud_id_login.add_argument('--timeout', type=int, default=7, help='Network operation timeout in seconds')
+    cloud_id_login.add_argument('--deadline', type=int, default=60, help='Hard limit for the complete probe in seconds')
+    cloud_id_login.add_argument('--insecure', action='store_true', help='Disable TLS certificate verification')
+    cloud_id_login.add_argument('--out', help='Write safe login result without credentials or session keys')
+    cloud_id_login.set_defaults(func=cmd_cloud_id_login_probe)
 
     token_info = sub.add_parser("token-info", help="Decode JWT access token payload")
     token_info.add_argument("--token", required=True)

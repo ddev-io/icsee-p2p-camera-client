@@ -15,12 +15,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from xmplayer.config.loader import load_monitor_config, validate_cloud_login_file
+from xmplayer.config.loader import load_monitor_config, validate_connection_credentials
 from xmplayer.core import legacy_api
 from xmplayer.core.service import (
     _alarm_service_hosts,
     _cache_machine_id,
     _load_or_refresh_rps_tokens,
+    _connection_login_text,
     describe_capture_failure,
     fetch_device_recordings,
     fetch_monitor_messages,
@@ -323,8 +324,9 @@ def main() -> int:
         _emit(rows, root, _fail('config', str(exc)))
         return _finish(rows, root)
 
-    login_issue = validate_cloud_login_file(cfg.cloud_login_file)
-    _emit(rows, root, _fail('login.txt', login_issue) if login_issue else _ok('login.txt', str(cfg.cloud_login_file)))
+    login_issue = validate_connection_credentials(cfg)
+    _emit(rows, root, _fail('connection credentials', login_issue) if login_issue
+          else _ok('connection credentials', cfg.connection_mode))
 
     try:
         import tkinter  # noqa: F401
@@ -372,7 +374,7 @@ def main() -> int:
         _emit(rows, root, _tcp_check(parsed.hostname or host, parsed.port or 6502))
 
     if not login_issue:
-        raw_text = cfg.cloud_login_file.read_text(encoding='utf-8-sig', errors='ignore')
+        raw_text = _connection_login_text(cfg)
         try:
             _emit(rows, root, 'RUN  cloud token load/refresh...')
             authcode, auth_info, _admin_token, admin_info = _load_or_refresh_rps_tokens(
@@ -395,6 +397,8 @@ def main() -> int:
                 ssl_verify=False,
                 user_agent=legacy_api.DEFAULT_STATUS_UA,
                 content_type='text/html',
+                message_type=('MSG_STATUS_MULTIQUERY_REQ' if cfg.connection_mode == 'cloud_id'
+                              else 'MSG_STATUS_LOCALQUERY_REQ'),
             )
             parsed = legacy_api.parse_status_protocol_response(status.json_data)
             server = ''
@@ -460,6 +464,10 @@ def main() -> int:
             except Exception:
                 pass
             _emit(rows, root, _fail('recordings query', str(exc)))
+
+        if cfg.connection_mode == 'cloud_id':
+            _emit(rows, root, 'INFO messages: app account sign-in is required; skipped in Cloud ID mode')
+            return _finish(rows, root)
 
         try:
             _emit(rows, root, 'RUN  messages query...')

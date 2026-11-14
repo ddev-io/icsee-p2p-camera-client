@@ -4300,6 +4300,7 @@ class AgentTcpEncryptedClaimProbe:
         plain_handoff_extend_on_activity: bool = False,
         dynamic_followup_queue: Any | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        stop_on_login_rejection: bool = False,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "status": "error",
@@ -5424,6 +5425,8 @@ class AgentTcpEncryptedClaimProbe:
                                     login_json = json.loads(login_payload) if login_payload.startswith("{") else {}
                                 except Exception:
                                     login_json = {}
+                                if stop_on_login_rejection and _intish(login_json.get('Ret'), 0) in {203, 204, 205, 206, 214, 215}:
+                                    end_time = time.time()
                                 if int(login_json.get("Ret") or 0) == 100:
                                     login_success_seen_at = time.time()
                                     runtime_session_id_live = int(parsed_frame.session_id or 0)
@@ -6064,12 +6067,14 @@ class RpsLiveChain:
         status_content_type: str = "text/html",
         status_ssl_verify: bool = False,
         agent_ssl_verify: bool = False,
+        preferred_status_server: tuple[str, str] | None = None,
     ) -> None:
         self.status_base = status_base
         self.status_user_agent = status_user_agent
         self.status_content_type = status_content_type
         self.status_ssl_verify = status_ssl_verify
         self.agent_ssl_verify = agent_ssl_verify
+        self.preferred_status_server = preferred_status_server
 
     def _pick_status_entry(self, body: list[Any], serial_number: str) -> dict[str, Any]:
         for item in body:
@@ -6170,6 +6175,10 @@ class RpsLiveChain:
 
         server_ip = str(status_server_ip or "").strip()
         server_port = str(status_server_port or "").strip()
+        if not (server_ip and server_port) and self.preferred_status_server:
+            server_ip, server_port = self.preferred_status_server
+        if not encrypted_claim_random_a:
+            encrypted_claim_random_a = str((encrypted_login_followup or {}).get('random_a') or '')
         if server_ip and server_port:
             _emit_progress(f"pub-status response cached {server_ip}:{server_port}")
             result["status_query"] = {
@@ -6629,6 +6638,7 @@ class RpsLiveChain:
                             followup_frames=encrypted_followup_frames,
                             followup_delay=encrypted_followup_delay,
                             login_followup_builder=encrypted_login_followup,
+                            stop_on_login_rejection=(encrypted_login_followup or {}).get('mode') == 'password',
                             controller_auto=encrypted_controller_auto,
                             controller_profile=encrypted_controller_profile,
                             plain_handoff_config=integrated_plain_handoff,
@@ -8370,7 +8380,10 @@ def build_6611_login_candidate(
             if rsa_user and rsa_pass:
                 user_value = rsa_user
                 password_value = rsa_pass
-                encrypt_type = "RSA_V1.5"
+                # FunSDK RSAV15() wraps the fields, then labels the login MD5.
+                # EncryptAlgo describes RSA framing; EncryptType describes the
+                # password digest the camera verifies after RSA decryption.
+                encrypt_type = "MD5"
         inner_payload["EncryptType"] = encrypt_type
         inner_payload["UserName"] = user_value
         inner_payload["PassWord"] = password_value
